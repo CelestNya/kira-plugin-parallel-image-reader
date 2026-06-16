@@ -69,14 +69,3 @@ LLM 请求 → [ON_LLM_REQUEST] 取 stash → 查缓存
 单图和并发多图使用不同的 VLM 提示词（不可配置，硬编码在代码中）：
 - 单图：KiraAI 内置提示
 - 多图：告知 VLM 这是第几张，要求详细描述细节以免因上下文缺失产生过简描述
-
-## 发布
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: v1.0.0"
-git tag v1.0.0
-git remote add origin <你的仓库地址>
-git push && git push --tags
-```
