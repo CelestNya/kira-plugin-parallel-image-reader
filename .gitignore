@@ -21,3 +21,11 @@ venv/
 
 # KiraAI local
 data/
+
+# VitePress
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/.vitepress/.temp/
+
+# Claude memory
+.claude/
