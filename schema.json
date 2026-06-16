@@ -1,0 +1,17 @@
+{
+    "max_concurrent": {
+        "type": "integer",
+        "default": 3,
+        "hint": "最大并发 VLM 调用数"
+    },
+    "quality_enabled": {
+        "type": "switch",
+        "default": false,
+        "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）"
+    },
+    "quality_value": {
+        "type": "integer",
+        "default": 85,
+        "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效"
+    }
+}
