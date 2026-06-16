@@ -10,6 +10,7 @@
 import asyncio
 import base64
 import io
+import time
 from pathlib import Path
 
 from PIL import Image as PILImage
@@ -36,6 +37,10 @@ MULTI_DESC_PROMPT = (
     "图中文字等，如果有文字请将其输出。"
 )
 
+# Stash 清理：未被 llm_request 消费的会话最长保留时间（秒）。
+# 防止消息进 buffer 但未触发 llm_request（撤回/超时/丢弃）导致的内存泄漏。
+_STASH_TTL_SEC = 600
+
 
 class ParallelImageReader(BasePlugin):
     """并行识别插件"""
@@ -54,6 +59,21 @@ class ParallelImageReader(BasePlugin):
 
         # Stash: session_id -> {placeholder_tag: Image|Sticker}
         self._stash: dict[str, dict[str, object]] = {}
+        # session_id -> 最后写入时间戳（用于 TTL 清理，防内存泄漏）
+        self._stash_ts: dict[str, float] = {}
+
+    def _evict_stale_stash(self):
+        """清理超过 TTL 未被消费的 stash 会话，防内存泄漏。"""
+        now = time.monotonic()
+        stale = [
+            sk for sk, ts in self._stash_ts.items()
+            if now - ts > _STASH_TTL_SEC
+        ]
+        for sk in stale:
+            self._stash.pop(sk, None)
+            self._stash_ts.pop(sk, None)
+        if stale:
+            logger.info(f"[ParallelImageReader] evicted {len(stale)} stale stash session(s)")
 
     # ── Lifecycle ──
 
@@ -71,6 +91,7 @@ class ParallelImageReader(BasePlugin):
 
     async def terminate(self):
         self._stash.clear()
+        self._stash_ts.clear()
         logger.info("[ParallelImageReader] terminated")
 
     # ── Chain extraction helpers ──
@@ -158,54 +179,62 @@ class ParallelImageReader(BasePlugin):
         db = self.ctx.db
 
         async def _one(idx: int, elem) -> str:
-            md5 = await elem.hash_image()
+            try:
+                md5 = await elem.hash_image()
 
-            # Cache check
-            cached = await db.get_image_desc_cache(md5)
-            if cached and cached.get("description"):
-                desc = cached["description"]
-                vlm_logger.info(
-                    f"[VLM] #{idx + 1}/{len(images)} cache HIT | "
-                    f"md5={md5[:8]}... | {desc[:80].replace(chr(10), ' ')}..."
+                # Cache check
+                cached = await db.get_image_desc_cache(md5)
+                if cached and cached.get("description"):
+                    desc = cached["description"]
+                    vlm_logger.info(
+                        f"[VLM] #{idx + 1}/{len(images)} cache HIT | "
+                        f"md5={md5[:8]}... | {desc[:80].replace(chr(10), ' ')}..."
+                    )
+                    return desc
+
+                # Pick prompt
+                prompt = (
+                    MULTI_DESC_PROMPT.format(index=idx + 1)
+                    if is_multi else SINGLE_DESC_PROMPT
                 )
+
+                async with sem:
+                    if self.quality_enabled:
+                        # Quality path: convert to PIL → JPEG(quality) → VLM
+                        data_url = await elem.to_data_url()
+                        raw_b64 = data_url.split(",", 1)[1] if "," in data_url else data_url
+                        buf = io.BytesIO(base64.b64decode(raw_b64))
+                        pil_image = PILImage.open(buf).convert("RGB")
+                        desc = await self._vlm_call(pil_image, prompt, self.quality_value)
+                    else:
+                        # Native path: desc_img (detail="high", no re-encode)
+                        vlm_logger.info(
+                            f"[VLM] #{idx + 1}/{len(images)} desc_img | "
+                            f"md5={md5[:8]}... | prompt={prompt[:60].replace(chr(10), ' ')}..."
+                        )
+                        desc = await desc_img(client=vlm, image=elem, prompt=prompt)
+                        desc_preview = desc[:80].replace(chr(10), " ") if desc else "(empty)"
+                        vlm_logger.info(
+                            f"[VLM] #{idx + 1}/{len(images)} done | "
+                            f"len={len(desc)} | {desc_preview}..."
+                        )
+
+                # Write back to cache
+                if desc:
+                    try:
+                        await db.add_image_desc_cache(md5, desc, count=1, last_seen=0)
+                    except Exception:
+                        pass
                 return desc
+            except Exception as e:
+                logger.warning(f"[ParallelImageReader] describe #{idx + 1} failed: {type(e).__name__}: {e}")
+                return ""
 
-            # Pick prompt
-            prompt = (
-                MULTI_DESC_PROMPT.format(index=idx + 1, total=len(images))
-                if is_multi else SINGLE_DESC_PROMPT
-            )
-
-            async with sem:
-                if self.quality_enabled:
-                    # Quality path: convert to PIL → JPEG(quality) → VLM
-                    data_url = await elem.to_data_url()
-                    raw_b64 = data_url.split(",", 1)[1] if "," in data_url else data_url
-                    buf = io.BytesIO(base64.b64decode(raw_b64))
-                    pil_image = PILImage.open(buf).convert("RGB")
-                    desc = await self._vlm_call(pil_image, prompt, self.quality_value)
-                else:
-                    # Native path: desc_img (detail="high", no re-encode)
-                    vlm_logger.info(
-                        f"[VLM] #{idx + 1}/{len(images)} desc_img | "
-                        f"md5={md5[:8]}... | prompt={prompt[:60].replace(chr(10), ' ')}..."
-                    )
-                    desc = await desc_img(client=vlm, image=elem, prompt=prompt)
-                    desc_preview = desc[:80].replace(chr(10), " ") if desc else "(empty)"
-                    vlm_logger.info(
-                        f"[VLM] #{idx + 1}/{len(images)} done | "
-                        f"len={len(desc)} | {desc_preview}..."
-                    )
-
-            # Write back to cache
-            if desc:
-                try:
-                    await db.add_image_desc_cache(md5, desc, count=1, last_seen=0)
-                except Exception:
-                    pass
-            return desc
-
-        return await asyncio.gather(*[_one(i, e) for i, e in enumerate(images)])
+        results = await asyncio.gather(
+            *[_one(i, e) for i, e in enumerate(images)],
+            return_exceptions=True,
+        )
+        return [r if isinstance(r, str) else "" for r in results]
 
     # ── VLM dispatch ──
 
@@ -224,15 +253,20 @@ class ParallelImageReader(BasePlugin):
     async def on_im_message(self, event: KiraMessageEvent):
         """Intercept IM messages: extract images, replace with placeholders."""
         session_key = event.session.sid if event.session else "default"
+        self._evict_stale_stash()
         stash = self._stash.setdefault(session_key, {})
         idx = [0]
 
         self._extract_and_replace(event.message.chain, stash, session_key, idx)
 
         if idx[0] > 0:
+            self._stash_ts[session_key] = time.monotonic()
             logger.info(
                 f"[ParallelImageReader] intercepted {idx[0]} images [{session_key}]"
             )
+        elif not stash:
+            # 没截到图且 stash 空 → 移除占位会话，避免空 dict 堆积
+            self._stash.pop(session_key, None)
         # Note: we deliberately do NOT call event.buffer() here.
         # The default chat plugin (priority=HIGH) handles the buffering strategy.
         # Running at SYS_HIGH-1 ensures we run first and modify the chain before
@@ -247,6 +281,7 @@ class ParallelImageReader(BasePlugin):
         """Before LLM invocation: inject image descriptions into the prompt."""
         session_key = event.session.sid if event.session else "default"
         stash = self._stash.pop(session_key, None)
+        self._stash_ts.pop(session_key, None)
         if not stash:
             return
 
