@@ -3,15 +3,16 @@
 ## 数据流
 
 ```
-IM 消息 → [ON_IM_MESSAGE] 提取 Image/Sticker → 替换为占位符 → 放行
-                                                          ↓
-LLM 请求 → [ON_LLM_REQUEST] 取 stash → 查缓存
-                                        ├─ HIT  → 直接取描述
-                                        └─ MISS → Semaphore × N 次 VLM
-                                                  ├─ 原生模式 → desc_img
-                                                  └─ 质量模式 → JPEG 压缩 → VLM
-                                        ↓
-                    替换占位符为 [Image: 描述内容] → 注入 system prompt
+IM 消息 → [ON_IM_MESSAGE] 遍历 chain
+                            ├─ 找到 Image/Sticker → hash 查缓存
+                            │                       ├─ HIT  → 直接用已有描述
+                            │                       └─ MISS → Semaphore × N 次 VLM
+                            │                                 ├─ 原生模式 → desc_img
+                            │                                 └─ 质量模式 → JPEG 压缩 → VLM
+                            │                                 ↓ 写入缓存
+                            └─ chain[i] = Text("[Image: 描述]") → 写入历史已是纯文字
+
+LLM 请求 → [ON_LLM_REQUEST] 无害通过，历史已清洁
 ```
 
 ## 事件优先级
@@ -19,11 +20,9 @@ LLM 请求 → [ON_LLM_REQUEST] 取 stash → 查缓存
 | 事件 | 优先级 | 说明 |
 |------|--------|------|
 | `ON_IM_MESSAGE` | `SYS_HIGH - 1` = 99 | 在默认 chat 插件之前拦截，修改消息链 |
-| `ON_LLM_REQUEST` | `SYS_HIGH - 1` = 99 | 在 LLM 请求前注入图片描述 |
+| `ON_LLM_REQUEST` | `SYS_HIGH - 1` = 99 | 仅注入 system prompt 说明 `[Image: ...]` 格式 |
 
-优先级确保了：
-1. 图片先被替换为占位符，默认 chat 插件看到的是纯文本
-2. VLM 调用在 LLM 请求前完成，描述已就绪
+优先级确保了图片在到达历史之前就已经被替换为文字描述。
 
 ## 缓存机制
 
@@ -38,10 +37,9 @@ LLM 请求 → [ON_LLM_REQUEST] 取 stash → 查缓存
 控制台以紫色 `[parallel_vlm]` 显示：
 
 ```
-[VLM] request | image=1920x1080 | quality=85 | prompt=描述这张图片...
+[VLM] #2/3 desc_img [qq:gm:123] | md5=a1b2c3d4... | prompt=描述这张图片...
+[VLM] #2/3 cache HIT [qq:gm:123] | md5=e5f6... | 一位金发少女...
 [VLM] response | len=342 | 画面中是一位年轻女性，身穿白色上衣...
-[VLM] #2/3 cache HIT | md5=a1b2c3d4... | 一位金发少女...
-[VLM] #2/3 desc_img | md5=e5f6... | prompt=这是用户发送的第 2 张...
-[VLM] FAILED | APITimeoutError: timeout
-[Inject] __IMG__sess_0__0__ -> [Image: 画面中是一位年轻女性...]
+[VLM] TIMEOUT | 60s
+[ParallelImageReader] described 3 images [qq:gm:123]
 ```
