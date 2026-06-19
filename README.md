@@ -1,15 +1,16 @@
 # Parallel Image Reader — 并行识图插件
 
-**KiraAI 插件** — 拦截 IM 消息中的图片，并发调用 VLM 描述，大幅降低多图场景的回复延迟。
+**KiraAI 插件** — 拦截 IM 消息中的图片，并发调用 VLM 描述后直接替换为文字，历史记录清洁无污染。
 
 ## 解决的问题
 
 KiraAI 原生按顺序处理图片：N 张图 = N 次串行 VLM 调用。多图场景下延迟叠加严重。
 
 本插件：
-- **零阻塞**拦截：`ON_IM_MESSAGE` 时将图片替换为占位符，不阻塞消息管道
-- **并发读图**：`ON_LLM_REQUEST` 时 Semaphore + `asyncio.gather` 并发调用 VLM
+- **并发读图**：Semaphore + `asyncio.gather` 并发调用 VLM
+- **零历史污染**：`ON_IM_MESSAGE` 时直接完成描述并替换为 `[Image: 描述]` 文字，写入历史的就是纯文字
 - **缓存复用**：使用 KiraAI 内置 `image_desc_cache`，相同图片秒回
+- **VLM 超时保护**：单次调用超时 60 秒，超时自动降级
 
 ## 安装
 
@@ -45,15 +46,16 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 ## 工作流程
 
 ```
-IM 消息 → [ON_IM_MESSAGE] 提取 Image/Sticker → 替换为占位符 → 放行
-                                                          ↓
-LLM 请求 → [ON_LLM_REQUEST] 取 stash → 查缓存
-                                        ├─ HIT  → 直接取描述
-                                        └─ MISS → Semaphore × N 次 VLM
-                                                  ├─ 原生模式 → desc_img
-                                                  └─ 质量模式 → JPEG 压缩 → VLM
-                                        ↓
-                    替换占位符为 [Image: 描述内容] → 注入 system prompt
+IM 消息 → [ON_IM_MESSAGE] 遍历 chain
+                            ├─ 找到 Image/Sticker → hash 查缓存
+                            │                       ├─ HIT  → 直接用已有描述
+                            │                       └─ MISS → Semaphore × N 次 VLM
+                            │                                 ├─ 原生模式 → desc_img
+                            │                                 └─ 质量模式 → JPEG 压缩 → VLM
+                            │                                 ↓ 写入缓存
+                            └─ chain[i] = Text("[Image: 描述]") → 写入历史已是纯文字
+
+LLM 请求 → 无事可做，历史已清洁
 ```
 
 ## 日志
@@ -61,11 +63,11 @@ LLM 请求 → [ON_LLM_REQUEST] 取 stash → 查缓存
 控制台日志以 `[parallel_vlm]`（紫色）显示：
 - `[VLM] request | image=1920x1080 | quality=85 | prompt=...`
 - `[VLM] response | len=342 | 画面中是一位年轻女性...`
-- `[VLM] cache HIT | md5=a1b2c3d4... | ...`
-- `[Inject] __IMG__sess__0__ -> [Image: ...]`
+- `[VLM] cache HIT [session] | md5=a1b2c3d4... | ...`
+- `[VLM] TIMEOUT | 60s`
 
-## 提示词
+## 版本记录
 
-单图和并发多图使用不同的 VLM 提示词（不可配置，硬编码在代码中）：
-- 单图：KiraAI 内置提示
-- 多图：告知 VLM 这是第几张，要求详细描述细节以免因上下文缺失产生过简描述
+- **v2.0.1** — 清理冗余代码、README 更新
+- **v2.0.0** — 重构：VLM 移至 on_im_message 内联替换，移除 stash/__IMG__ 机制
+- **v1.1.0** — 并行识别、缓存、质量压缩
