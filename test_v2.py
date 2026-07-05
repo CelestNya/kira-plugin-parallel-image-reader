@@ -949,6 +949,255 @@ async def _t32():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 边界条件测试 (T33-T40)
+# ═══════════════════════════════════════════════════════════════
+
+# ── T33: hash_image 阶段1失败 → 仍设占位符，阶段2降级 ──
+
+class _HashFailImage(Image):
+    """hash_image 始终抛异常的图片元素。"""
+    def __init__(self):
+        super().__init__(md5="unused")
+
+    async def hash_image(self):
+        raise RuntimeError("image data corrupted")
+
+
+@_test("T33: hash_image 失败 → 阶段1降级占位，阶段2降级描述")
+async def _t33():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    img = _HashFailImage()
+    ev = FakeMessageEvent([img, Text("hello")])
+    await plug.on_im_message(ev)
+
+    # 阶段1应设占位符（用 noid_ 前缀），不崩溃
+    _check(isinstance(ev.message.chain[0], Text), "should be Text placeholder")
+    _check(_is_placeholder(ev.message.chain[0].text), f"not placeholder: {ev.message.chain[0].text!r}")
+    pending = getattr(ev.message, "_pir_pending", None)
+    _check(pending is not None and len(pending) == 1, "should have 1 pending")
+
+    # 阶段2：hash 再次失败，_one 的 try/except 捕获，返回空描述
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # 占位符应被替换为降级文本
+    _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+# ── T34: VLM 未配置 (get_default_vlm 返回 None) ──
+
+class _NoneVLMProviderMgr:
+    """get_default_vlm 返回 None 的 ProviderManager。"""
+    def get_default_vlm(self):
+        return None
+
+
+@_test("T34: VLM 未配置 → 降级描述，不崩溃")
+async def _t34():
+    mod, _ = load_plugin()
+
+    class _NoneVLMCtx(FakeCtx):
+        def __init__(self):
+            super().__init__(FakeDB(), FakeVLM(""))  # vlm 不会被用到
+        @property
+        def provider_mgr(self):
+            return _NoneVLMProviderMgr()
+
+    ctx = _NoneVLMCtx()
+    plug = mod.ParallelImageReader(ctx, {})
+    await plug.initialize()
+
+    img = Image(md5="t34_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # 不崩溃，占位符被替换为降级文本
+    _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+# ── T35: VLM chat 抛异常（非超时） ──
+
+class _CrashVLM:
+    """chat 始终抛异常的 VLM。"""
+    def __init__(self):
+        self.call_count = 0
+    async def chat(self, request):
+        self.call_count += 1
+        raise ConnectionError("VLM API unreachable")
+
+
+def _make_crash_ctx(db, crash_vlm):
+    """构造 VLM 始终崩溃的 context。"""
+    class _CrashProviderMgr:
+        def get_default_vlm(self):
+            return crash_vlm
+    mod, _ = load_plugin()
+
+    class _CrashCtx(FakeCtx):
+        @property
+        def provider_mgr(self):
+            return _CrashProviderMgr()
+    ctx = _CrashCtx(db, crash_vlm)
+    return mod, ctx
+
+
+@_test("T35: VLM chat 抛异常 → 降级描述，不影响其他图片")
+async def _t35():
+    db = FakeDB()
+    crash_vlm = _CrashVLM()
+    mod, ctx = _make_crash_ctx(db, crash_vlm)
+    plug = mod.ParallelImageReader(ctx, {})
+    await plug.initialize()
+
+    imgs = [Image(md5=f"t35_{i}_0000000000000000000000000a") for i in range(3)]
+    ev = FakeMessageEvent(imgs)
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # 3 张图都降级
+    _check(crash_vlm.call_count == 3, f"VLM called {crash_vlm.call_count} times (expected 3)")
+    _check(batch_msg.message_str.count("(description unavailable)") == 3,
+           f"got: {batch_msg.message_str}")
+    _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
+
+
+# ── T36: to_data_url 失败（quality 模式） ──
+
+class _DataUrlFailImage(Image):
+    """to_data_url 抛异常的图片。"""
+    def __init__(self):
+        super().__init__(md5="t36_md5_0000000000000000000000a")
+
+    async def to_data_url(self):
+        raise IOError("failed to download image")
+
+
+@_test("T36: quality 模式 to_data_url 失败 → 降级描述")
+async def _t36():
+    plug, mod = await _make_plugin(
+        FakeDB(), FakeVLM("desc"),
+        cfg={"quality_enabled": True, "quality_value": 50}
+    )
+    img = _DataUrlFailImage()
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
+
+
+# ── T37: _pir_pending 丢失（message 实例未复用） ──
+
+@_test("T37: _pir_pending 丢失 → 占位符降级清理，不崩溃")
+async def _t37():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    img = Image(md5="t37_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    # 构造一个没有 _pir_pending 的 batch_msg（模拟实例未复用）
+    chain = ev.message.chain  # chain 里有占位 Text
+    batch_msg = FakeBatchMessage(chain, message_str="<!--PIR:t37_md5_00000000000000000000000a-->")
+    batch_msg._pir_pending = None  # 模拟丢失
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    await plug.on_im_batch_message(batch_ev)
+
+    # 占位符应被清理为降级文本
+    _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+# ── T38: 同一图片重复出现（同 md5，多消息） ──
+
+@_test("T38: 同一图片在多消息中重复 → 各自替换正确")
+async def _t38():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("same desc"))
+    md5 = "t38_md5_00000000000000000000000a"
+    img1 = Image(md5=md5)
+    img2 = Image(md5=md5)  # 同 md5
+    ev1 = FakeMessageEvent([img1, Text("msg1")])
+    ev2 = FakeMessageEvent([img2, Text("msg2")])
+    await plug.on_im_message(ev1)
+    await plug.on_im_message(ev2)
+
+    batch_msg1 = _make_batch_from_event(ev1)
+    batch_msg2 = _make_batch_from_event(ev2)
+    batch_ev = FakeMessageBatchEvent([batch_msg1, batch_msg2])
+    await plug.on_im_batch_message(batch_ev)
+
+    # 两条消息的占位符都应被替换
+    _check("[Image: same desc]" in batch_msg1.message_str, f"msg1: {batch_msg1.message_str}")
+    _check("[Image: same desc]" in batch_msg2.message_str, f"msg2: {batch_msg2.message_str}")
+    _check("<!--PIR" not in batch_msg1.message_str, "msg1 leaked")
+    _check("<!--PIR" not in batch_msg2.message_str, "msg2 leaked")
+
+
+# ── T39: message_str 为 None ──
+
+@_test("T39: message_str 为 None → 不崩溃，chain 仍替换")
+async def _t39():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    img = Image(md5="t39_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_msg.message_str = None  # 模拟 None
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # chain 中的占位符应被替换
+    _check("[Image: desc]" == batch_msg.chain[0].text, f"chain: {batch_msg.chain[0].text}")
+
+
+# ── T40: 混合场景（hash成功+失败+缓存命中+VLM失败） ──
+
+@_test("T40: 混合场景 — hash成功/失败/缓存命中/VLM失败 共存")
+async def _t40():
+    db = FakeDB()
+    db.seed("cached_md5_000000000000000000000000", "cached desc")
+    crash_vlm = _CrashVLM()
+    mod, ctx = _make_crash_ctx(db, crash_vlm)
+    plug = mod.ParallelImageReader(ctx, {})
+    await plug.initialize()
+
+    # 4 张图：缓存命中、hash失败、VLM会失败(hash成功)、正常(hash成功但VLM失败)
+    img_cached = Image(md5="cached_md5_000000000000000000000000")
+    img_hashfail = _HashFailImage()
+    img_vlmfail1 = Image(md5="vlmfail1_00000000000000000000000a")
+    img_vlmfail2 = Image(md5="vlmfail2_00000000000000000000000a")
+    ev = FakeMessageEvent([img_cached, img_hashfail, img_vlmfail1, img_vlmfail2])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # 缓存命中的有描述
+    _check("[Image: cached desc]" in batch_msg.message_str, f"cached: {batch_msg.message_str}")
+    # 其余降级
+    _check(batch_msg.message_str.count("(description unavailable)") == 3,
+           f"expected 3 unavailable, got: {batch_msg.message_str}")
+    # 无占位符泄漏
+    _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
+
+
+# ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
 
@@ -968,6 +1217,8 @@ _TESTS = [
     _t31,
     # 污染缓存忽略
     _t32,
+    # 边界条件
+    _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40,
 ]
 
 
