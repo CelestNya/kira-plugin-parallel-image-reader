@@ -1,5 +1,5 @@
 """
-v2.1.0 两阶段架构测试。stub 重依赖后加载真实 ParallelImageReader，零网络/DB 依赖。
+v2.1.1 两阶段架构测试。stub 重依赖后加载真实 ParallelImageReader，零网络/DB 依赖。
 覆盖：阶段1占位替换+暂存、阶段2并行VLM+message_str替换、缓存、嵌套、并发、超时、
       异常隔离、环检测、discard 零 VLM。
 
@@ -894,7 +894,7 @@ async def _t30():
            f"hint not injected: {fake_prompt.content}")
 
 
-# ── 缓存不被污染测试（回归 v2.1.0 caption 方案的 bug）──
+# ── 缓存不被污染测试（回归：占位符不应写入缓存）──
 
 @_test("T31: 缓存不被占位符污染")
 async def _t31():
@@ -1224,7 +1224,7 @@ _TESTS = [
 
 def main():
     global _PASS, _FAIL, _SKIP
-    print(f"\nParallel Image Reader v2.1.0 — 两阶段架构测试\n")
+    print(f"\nParallel Image Reader v2.1.1 — 两阶段架构测试\n")
     print(f"共 {len(_TESTS)} 个测试\n")
 
     asyncio.run(_run_all())

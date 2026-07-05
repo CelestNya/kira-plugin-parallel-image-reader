@@ -1,5 +1,5 @@
 """
-并行识图插件 v2.1.0 — Parallel Image Reader
+并行识图插件 v2.1.1 — Parallel Image Reader
 
 两阶段架构，既不污染聊天历史，也不浪费 VLM 调用：
 
@@ -67,7 +67,7 @@ def _is_valid_desc(desc: str) -> bool:
 
 
 class ParallelImageReader(BasePlugin):
-    """并行识图插件 v2.1.0 — 两阶段架构"""
+    """并行识图插件 v2.1.1 — 两阶段架构"""
 
     def __init__(self, ctx: PluginContext, cfg: dict):
         super().__init__(ctx, cfg)
@@ -86,7 +86,7 @@ class ParallelImageReader(BasePlugin):
         self.quality_value = self.plugin_cfg.get("quality_value", 85)
 
         logger.info(
-            f"[ParallelImageReader] v2.1.0 initialized: "
+            f"[ParallelImageReader] v2.1.1 initialized: "
             f"max_concurrent={self.max_concurrent}, "
             f"quality={'on(' + str(self.quality_value) + ')' if self.quality_enabled else 'off'}"
         )
