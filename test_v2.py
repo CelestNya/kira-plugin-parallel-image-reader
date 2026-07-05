@@ -346,7 +346,7 @@ def _chain_texts(chain) -> list[str]:
 
 
 import re as _re
-_PH_RE = _re.compile(r"\x00PIR_[^\x00]+\x00")
+_PH_RE = _re.compile(r"<!--PIR:[^>]*-->")
 
 
 def _is_placeholder(text: str) -> bool:
@@ -531,7 +531,7 @@ async def _t9():
 
     # message_str 中的占位符应被替换
     _check("[Image: 一只猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
-    _check("\x00PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
     # chain 中的占位 Text 也应被替换
     _check("[Image: 一只猫]" == batch_msg.chain[0].text, f"chain[0]: {batch_msg.chain[0].text}")
 
@@ -551,7 +551,7 @@ async def _t10():
     elapsed = time.monotonic() - t0
 
     # 3 个占位符都应被替换
-    _check("\x00PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
     count = batch_msg.message_str.count("[Image: desc]")
     _check(count == 3, f"expected 3, got {count}")
     _check(elapsed < 0.12, f"took {elapsed:.3f}s, expected < 0.12s (parallel)")
@@ -797,7 +797,7 @@ async def _t25():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    _check("\x00PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+    _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
     _check("[Image: 猫]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
@@ -815,7 +815,7 @@ async def _t26():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    _check("\x00PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+    _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
     _check("[Image: cached desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
@@ -836,7 +836,7 @@ async def _t27():
     except Exception:
         pass  # 异常应被捕获
 
-    _check("\x00PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+    _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
 
 
 # ── discard 零 VLM 测试 ──
@@ -914,7 +914,7 @@ async def _t31():
     cached = await db.get_image_desc_cache(md5)
     _check(cached is not None, "not cached")
     _check(cached["description"] == "real desc", f"cached: {cached['description']!r}")
-    _check("\x00PIR" not in cached["description"], f"cache polluted: {cached['description']!r}")
+    _check("<!--PIR" not in cached["description"], f"cache polluted: {cached['description']!r}")
 
 
 @_test("T32: 污染缓存（含\\x00）被忽略，走 VLM")

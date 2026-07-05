@@ -42,15 +42,28 @@ DESC_PROMPT = "描述这张图片的内容，如果有文字请将其输出"
 VLM_TIMEOUT = 60
 
 # 占位符：替换 chain 中的 Image/Sticker，阻止本体 message_format_to_text 调 VLM。
-# 格式 \x00PIR_{md5}\x00 —— 不可见控制字符 + 图片标识，保证唯一且不与正常文本冲突。
-# 在 ON_IM_BATCH_MESSAGE 阶段（持久化之前）被替换为真实描述，不进入历史。
-# md5 可能是任意 hash_image() 返回的字符串，用非贪婪匹配。
-_PLACEHOLDER_RE = re.compile(r"\x00PIR_[^\x00]+\x00")
+# 格式 <!--PIR:md5--> —— XML 注释样式，即使泄漏到 LLM 输入也会被当作注释忽略，
+# 人类可读，且不与正常文本冲突。在 ON_IM_BATCH_MESSAGE 阶段（持久化之前）被
+# 替换为真实描述，不进入历史。
+_PLACEHOLDER_RE = re.compile(r"<!--PIR:[^>]*-->")
 
 
 def _make_placeholder(md5: str) -> str:
     """生成占位符文本。"""
-    return f"\x00PIR_{md5}\x00"
+    return f"<!--PIR:{md5}-->"
+
+
+def _is_valid_desc(desc: str) -> bool:
+    """检查缓存描述是否有效——排除控制字符和占位符标记的污染数据。"""
+    if not desc:
+        return False
+    if "\x00" in desc:
+        # 旧 caption 方案遗留的 \x00IMG_PENDING_ 污染
+        return False
+    if "<!--PIR:" in desc:
+        # 新占位符标记的自我污染（理论上不会发生，防御性检查）
+        return False
+    return True
 
 
 class ParallelImageReader(BasePlugin):
@@ -131,14 +144,14 @@ class ParallelImageReader(BasePlugin):
                     md5 = None
 
                 # 查缓存：命中则直接用描述做占位符（后续无需 VLM）
-                # 防御：描述含 \x00 控制字符的视为无效（历史污染数据），不当作命中
+                # 防御：描述含控制字符或占位符标记的视为无效（历史污染数据），不当作命中
                 desc_cached = None
                 if md5:
                     try:
                         entry = await db.get_image_desc_cache(md5)
                         if entry and entry.get("description"):
                             raw_desc = entry["description"]
-                            if "\x00" not in raw_desc:
+                            if _is_valid_desc(raw_desc):
                                 desc_cached = raw_desc
                                 cached_count += 1
                             else:
@@ -359,9 +372,9 @@ class ParallelImageReader(BasePlugin):
                 md5 = await elem.hash_image()
 
                 # 双重检查缓存（on_im_message 已查过，但可能并发刷新）
-                # 防御：描述含 \x00 控制字符的视为无效（历史污染数据）
+                # 防御：描述含控制字符或占位符标记的视为无效（历史污染数据）
                 cached = await db.get_image_desc_cache(md5)
-                if cached and cached.get("description") and "\x00" not in cached["description"]:
+                if cached and cached.get("description") and _is_valid_desc(cached["description"]):
                     desc = cached["description"]
                     vlm_logger.info(
                         f"[VLM] #{idx + 1}/{len(images)} cache HIT [{session_key}] | "
