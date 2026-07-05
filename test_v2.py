@@ -1,5 +1,5 @@
 """
-v2.1.1 两阶段架构测试。stub 重依赖后加载真实 ParallelImageReader，零网络/DB 依赖。
+v2.2.0 两阶段架构 + 乐观加载测试。stub 重依赖后加载真实 ParallelImageReader，零网络/DB 依赖。
 覆盖：阶段1占位替换+暂存、阶段2并行VLM+message_str替换、缓存、嵌套、并发、超时、
       异常隔离、环检测、discard 零 VLM。
 
@@ -235,9 +235,11 @@ class FakeMessageEvent:
 
 class FakeBatchMessage:
     """模拟 batch 中的单条消息。chain 是已经过阶段1处理的（Image→Text占位）。"""
-    def __init__(self, chain, message_str=None, _pir_pending=None):
+    def __init__(self, chain, message_str=None, _pir_pending=None,
+                 _pir_optimistic=None):
         self.chain = FakeMessageChain(chain)
         self._pir_pending = _pir_pending
+        self._pir_optimistic = _pir_optimistic
         self.message_str = message_str if message_str is not None else _simulate_format_to_text(chain)
 
 
@@ -359,6 +361,7 @@ def _make_batch_from_event(ev: FakeMessageEvent) -> FakeBatchMessage:
 
     模拟本体 flush_session_messages 的行为：batch 里的 message 就是
     ON_IM_MESSAGE 阶段的 event.message（同一个实例）。
+    附带传递 _pir_pending 和 _pir_optimistic。
     """
     msg = ev.message
     # 重新生成 message_str（模拟本体 message_format_to_text，此时 chain 已含占位 Text）
@@ -367,6 +370,7 @@ def _make_batch_from_event(ev: FakeMessageEvent) -> FakeBatchMessage:
         chain=msg.chain,
         message_str=msg.message_str,
         _pir_pending=getattr(msg, "_pir_pending", None),
+        _pir_optimistic=getattr(msg, "_pir_optimistic", None),
     )
 
 
@@ -1198,6 +1202,158 @@ async def _t40():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 乐观加载测试（eager_loading，v2.2.0）
+# ═══════════════════════════════════════════════════════════════
+
+@_test("T41: 乐观加载开启 → on_im_message 不阻塞，启动后台 VLM task")
+async def _t41():
+    """VLM delay=0.1s，on_im_message 应在 0.05s 内返回（非阻塞）。"""
+    vlm = FakeVLM("desc", delay=0.1)
+    plug, mod = await _make_plugin(
+        FakeDB(), vlm, {"eager_loading": True}
+    )
+    img = Image(md5="t41_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    t0 = time.monotonic()
+    await plug.on_im_message(ev)
+    elapsed = time.monotonic() - t0
+    _check(elapsed < 0.05,
+           f"on_im_message blocked {elapsed:.3f}s (VLM delay=0.1s)")
+    pending = getattr(ev.message, "_pir_pending", None)
+    _check(pending is not None and len(pending) == 1, "should have 1 pending")
+    task = getattr(ev.message, "_pir_optimistic", None)
+    _check(task is not None, "should have optimistic task")
+    await asyncio.sleep(0.15)  # 等待 task 完成
+    _check(vlm.call_count == 1, f"VLM called {vlm.call_count}, expected 1")
+
+
+@_test("T42: 乐观加载开启 → batch 阶段复用 task，VLM 不重复调用")
+async def _t42():
+    db = FakeDB()
+    vlm = FakeVLM("eager_desc", delay=0.02)
+    plug, mod = await _make_plugin(db, vlm, {"eager_loading": True})
+    md5 = "t42_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check(vlm.call_count == 1,
+           f"VLM called {vlm.call_count}, expected 1 (reuse)")
+    _check("[Image: eager_desc]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str}")
+    _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
+    cached = await db.get_image_desc_cache(md5)
+    _check(cached and cached["description"] == "eager_desc",
+           f"cache: {cached['description'] if cached else 'None'}")
+
+
+@_test("T43: 乐观加载开启 + 全缓存命中 → 不启动 task")
+async def _t43():
+    db = FakeDB()
+    db.seed("t43_md5_00000000000000000000000a", "cached desc")
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"eager_loading": True})
+    img = Image(md5="t43_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    pending = getattr(ev.message, "_pir_pending", None)
+    _check(pending is None or len(pending) == 0,
+           "should have no pending (cache hit)")
+    task = getattr(ev.message, "_pir_optimistic", None)
+    _check(task is None, "should have no optimistic task (cache hit)")
+    _check(vlm.call_count == 0,
+           f"VLM called {vlm.call_count}, expected 0")
+
+
+@_test("T44: 乐观加载开启 + task 异常 → 降级文本，不崩溃")
+async def _t44():
+    """手动设置一个崩溃的 _pir_optimistic task，验证异常隔离。"""
+    plug, mod = await _make_plugin(
+        FakeDB(), FakeVLM(""), {"eager_loading": True}
+    )
+    md5 = "t44_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    # 覆盖为会崩溃的 task（加 sleep(0) 让事件循环先调度 gather，
+    # 避免 "Task exception was never retrieved" 警告）
+    async def _crash():
+        await asyncio.sleep(0)  # 让 gather 有机会捕获异常
+        raise RuntimeError("sim crash for T44")
+    crash_task = asyncio.create_task(_crash())
+    ev.message._pir_optimistic = crash_task
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("<!--PIR" not in batch_msg.message_str,
+           f"placeholder leaked: {batch_msg.message_str!r}")
+    _check("(description unavailable)" in batch_msg.message_str,
+           f"got: {batch_msg.message_str}")
+
+
+@_test("T45: 乐观加载关闭 → 行为不变（回归）")
+async def _t45():
+    """eager_loading=False（默认）时 _pir_optimistic 不被设置。"""
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(FakeDB(), vlm)
+    img = Image(md5="t45_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    pending = getattr(ev.message, "_pir_pending", None)
+    _check(pending is not None, "should have pending")
+    task = getattr(ev.message, "_pir_optimistic", None)
+    _check(task is None, "should NOT have optimistic task when eager=off")
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+    _check("[Image: desc]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str}")
+    _check(vlm.call_count == 1,
+           f"VLM called {vlm.call_count}, expected 1 (fresh)")
+
+
+@_test("T46: 乐观加载开启 + 多消息 batch → 全部正确处理")
+async def _t46():
+    """两条消息，都有 pending，batch 阶段合并处理。"""
+    db = FakeDB()
+    vlm = FakeVLM("desc46", delay=0.01)
+    plug, mod = await _make_plugin(db, vlm, {"eager_loading": True})
+    md5_1 = "t46_1_md5_00000000000000000000000a"
+    md5_2 = "t46_2_md5_00000000000000000000000b"
+    img1 = Image(md5=md5_1)
+    img2 = Image(md5=md5_2)
+    ev1 = FakeMessageEvent([img1, Text("msg1")])
+    ev2 = FakeMessageEvent([img2, Text("msg2")])
+    await plug.on_im_message(ev1)
+    await plug.on_im_message(ev2)
+
+    batch_msg1 = _make_batch_from_event(ev1)
+    batch_msg2 = _make_batch_from_event(ev2)
+    batch_ev = FakeMessageBatchEvent([batch_msg1, batch_msg2])
+    await plug.on_im_batch_message(batch_ev)
+
+    # VLM 仅被每条消息的 on_im_message 各调一次
+    _check(vlm.call_count == 2,
+           f"VLM called {vlm.call_count}, expected 2")
+    _check("[Image: desc46]" in batch_msg1.message_str,
+           f"msg1: {batch_msg1.message_str}")
+    _check("[Image: desc46]" in batch_msg2.message_str,
+           f"msg2: {batch_msg2.message_str}")
+    _check("<!--PIR" not in batch_msg1.message_str, "msg1 placeholder leaked")
+    _check("<!--PIR" not in batch_msg2.message_str, "msg2 placeholder leaked")
+
+
+# ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
 
@@ -1219,12 +1375,14 @@ _TESTS = [
     _t32,
     # 边界条件
     _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40,
+    # 乐观加载（v2.2.0）
+    _t41, _t42, _t43, _t44, _t45, _t46,
 ]
 
 
 def main():
     global _PASS, _FAIL, _SKIP
-    print(f"\nParallel Image Reader v2.1.1 — 两阶段架构测试\n")
+    print(f"\nParallel Image Reader v2.2.0 — 两阶段架构 + 乐观加载测试\n")
     print(f"共 {len(_TESTS)} 个测试\n")
 
     asyncio.run(_run_all())

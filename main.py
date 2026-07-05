@@ -1,5 +1,5 @@
 """
-并行识图插件 v2.1.1 — Parallel Image Reader
+并行识图插件 v2.2.0 — Parallel Image Reader
 
 两阶段架构，既不污染聊天历史，也不浪费 VLM 调用：
 
@@ -14,6 +14,11 @@
    Text 不触发 VLM）。插件并行描述所有暂存图片，替换 message_str 中的
    占位符为 [Image: 描述]，同时替换 chain 元素。message_str 在持久化
    之前被修正，占位符不进入历史。
+
+乐观加载（eager_loading，默认关闭）：ON_IM_MESSAGE 阶段通过
+asyncio.create_task 启动后台 VLM task，不阻塞 handler 链；
+ON_IM_BATCH_MESSAGE 阶段 await 复用结果。被 discard 的消息仍然会
+完成 VLM 调用（结果写入缓存可被复用），启用后 VLM 调用量会增加。
 
 配置项见 schema.json。
 """
@@ -67,7 +72,7 @@ def _is_valid_desc(desc: str) -> bool:
 
 
 class ParallelImageReader(BasePlugin):
-    """并行识图插件 v2.1.1 — 两阶段架构"""
+    """并行识图插件 v2.2.0 — 两阶段架构 + 乐观加载"""
 
     def __init__(self, ctx: PluginContext, cfg: dict):
         super().__init__(ctx, cfg)
@@ -77,6 +82,10 @@ class ParallelImageReader(BasePlugin):
         self.quality_enabled: bool = False
         self.quality_value: int = 85
 
+        # 乐观加载 in-flight task 强引用池（防 GC 回收）
+        self._optimistic_tasks: set = set()
+        self._sem = None  # initialize 中创建
+
     # ── Lifecycle ──
 
     async def initialize(self):
@@ -84,14 +93,22 @@ class ParallelImageReader(BasePlugin):
         self.max_concurrent = self.plugin_cfg.get("max_concurrent", 3)
         self.quality_enabled = self.plugin_cfg.get("quality_enabled", False)
         self.quality_value = self.plugin_cfg.get("quality_value", 85)
+        self.eager_loading = self.plugin_cfg.get("eager_loading", False)
+        self._sem = asyncio.Semaphore(self.max_concurrent)
 
+        eager_str = f", eager={'on' if self.eager_loading else 'off'}"
         logger.info(
-            f"[ParallelImageReader] v2.1.1 initialized: "
+            f"[ParallelImageReader] v2.2.0 initialized: "
             f"max_concurrent={self.max_concurrent}, "
             f"quality={'on(' + str(self.quality_value) + ')' if self.quality_enabled else 'off'}"
+            f"{eager_str}"
         )
 
     async def terminate(self):
+        """取消所有未完成乐观加载 task，防泄漏。"""
+        for task in list(self._optimistic_tasks):
+            task.cancel()
+        self._optimistic_tasks.clear()
         logger.info("[ParallelImageReader] terminated")
 
     # ── Chain traversal ──
@@ -176,10 +193,25 @@ class ParallelImageReader(BasePlugin):
             if pending:
                 # 挂到 message 上，batch 阶段读取（message 实例在两阶段间是同一个对象）
                 event.message._pir_pending = pending
-                logger.info(
-                    f"[ParallelImageReader] stashed {len(pending)} pending, "
-                    f"{cached_count} cache-hit [{session_key}]"
-                )
+                if self.eager_loading:
+                    # 乐观加载：立即启动 VLM task，不应 await
+                    images = [p[1] for p in pending]
+                    task = asyncio.create_task(
+                        self._describe_parallel(images, session_key)
+                    )
+                    self._optimistic_tasks.add(task)
+                    task.add_done_callback(self._optimistic_tasks.discard)
+                    event.message._pir_optimistic = task
+                    logger.info(
+                        f"[ParallelImageReader] eager VLM started "
+                        f"[{session_key}]: {len(images)} images "
+                        f"({cached_count} cache-hit)"
+                    )
+                else:
+                    logger.info(
+                        f"[ParallelImageReader] stashed {len(pending)} pending, "
+                        f"{cached_count} cache-hit [{session_key}]"
+                    )
         except Exception as e:
             logger.error(
                 f"[ParallelImageReader] on_im_message failed [{session_key}]: "
@@ -197,47 +229,72 @@ class ParallelImageReader(BasePlugin):
         """
         session_key = event.session.sid if event.session else "default"
         try:
-            # 1. 收集所有 pending 图片
-            all_pending: list = []  # [(message, placeholder, ele, md5), ...]
+            # 1. 收集所有 pending 图片，分流乐观/非乐观
+            optimistic_groups: list = []      # [(task, pending_list), ...]
+            non_optimistic_pending: list = []  # [(message, placeholder, ele, md5), ...]
             for message in event.messages:
                 pending = getattr(message, "_pir_pending", None)
-                if pending:
+                if not pending:
+                    continue
+                task = getattr(message, "_pir_optimistic", None)
+                if task is not None:
+                    optimistic_groups.append((task, pending))
+                else:
                     for placeholder, ele, md5 in pending:
-                        all_pending.append((message, placeholder, ele, md5))
+                        non_optimistic_pending.append((message, placeholder, ele, md5))
 
-            if not all_pending:
+            if not optimistic_groups and not non_optimistic_pending:
                 # 全部缓存命中或无图片——仍需清理可能残留的占位符
                 self._cleanup_placeholders(event)
                 return
 
-            images = [item[2] for item in all_pending]
-            mode = "quality" if self.quality_enabled else "native"
-
-            # 2. 并行 VLM
-            descriptions = await self._describe_parallel(images, session_key)
-
-            # 3. 按 message 分组替换
-            #    placeholder → 最终 [Image: 描述] 文本
             placeholder_map: dict[str, str] = {}
-            for (message, placeholder, ele, md5), desc in zip(all_pending, descriptions):
-                final = f"[Image: {desc or '(description unavailable)'}]"
-                placeholder_map[placeholder] = final
 
-            # 4. 替换每个 message 的 message_str 和 chain
+            # 2. 并行：乐观 task await + 非乐观 on-demand VLM
+            async def _do_optimistic():
+                if not optimistic_groups:
+                    return
+                results = await asyncio.gather(
+                    *[t for t, _ in optimistic_groups],
+                    return_exceptions=True,
+                )
+                for (_, pending), res in zip(optimistic_groups, results):
+                    descs = res if isinstance(res, list) else [""] * len(pending)
+                    for (placeholder, _, _), desc in zip(pending, descs):
+                        placeholder_map[placeholder] = \
+                            f"[Image: {desc or '(description unavailable)'}]"
+
+            async def _do_non_optimistic():
+                if not non_optimistic_pending:
+                    return
+                imgs = [item[2] for item in non_optimistic_pending]
+                descs = await self._describe_parallel(imgs, session_key)
+                for (_, placeholder, _, _), desc in zip(non_optimistic_pending, descs):
+                    placeholder_map[placeholder] = \
+                        f"[Image: {desc or '(description unavailable)'}]"
+
+            await asyncio.gather(_do_optimistic(), _do_non_optimistic())
+
+            # 3. 替换每个 message 的 message_str 和 chain
             for message in event.messages:
-                # 修 message_str（持久化前，占位符不进历史）
                 if message.message_str:
                     for ph, final in placeholder_map.items():
                         message.message_str = message.message_str.replace(ph, final)
-                # 修 chain 元素（占位 Text → 真实描述 Text）
-                #    _walk 只遍历 Image/Sticker，阶段1已替换为 Text，
-                #    所以这里单独遍历所有 Text 检查是否为占位符
                 self._replace_placeholders_in_chain(message.chain, placeholder_map)
 
+            total = sum(len(p) for _, p in optimistic_groups) + len(non_optimistic_pending)
+            mode = "quality" if self.quality_enabled else "native"
+            eager_info = f", eager={sum(len(p) for _, p in optimistic_groups)}" \
+                if optimistic_groups else ""
             logger.info(
-                f"[ParallelImageReader] described {len(images)} images "
-                f"({mode}, concurrency={self.max_concurrent}) [{session_key}]"
+                f"[ParallelImageReader] described {total} images"
+                f" ({mode}, concurrency={self.max_concurrent}{eager_info}) "
+                f"[{session_key}]"
             )
+        except asyncio.CancelledError:
+            # Ctrl+C / 任务取消：清理占位符后重新抛出，不拦截取消
+            self._cleanup_placeholders(event)
+            raise
         except Exception as e:
             logger.error(
                 f"[ParallelImageReader] on_im_batch_message failed [{session_key}]: "
@@ -268,7 +325,10 @@ class ParallelImageReader(BasePlugin):
 
     @staticmethod
     def _cleanup_placeholders(event: KiraMessageBatchEvent):
-        """把所有 message_str 和 chain 中残留的占位符替换为降级文本。"""
+        """把所有 message_str 和 chain 中残留的占位符替换为降级文本。
+
+        复用 _replace_placeholders_in_chain 避免重复 chain 遍历逻辑。
+        """
         try:
             for message in event.messages:
                 # 修 message_str
@@ -276,9 +336,11 @@ class ParallelImageReader(BasePlugin):
                     message.message_str = _PLACEHOLDER_RE.sub(
                         "(description unavailable)", message.message_str
                     )
-                # 修 chain 元素（递归遍历找占位 Text）
+                # 修 chain：收集占位符 → 复用 _replace_placeholders_in_chain
                 if hasattr(message, "chain"):
-                    def _fix(chain, visited=None):
+                    _pmap: dict[str, str] = {}
+
+                    def _collect(chain, visited=None):
                         if visited is None:
                             visited = set()
                         cid = id(chain)
@@ -287,13 +349,18 @@ class ParallelImageReader(BasePlugin):
                         visited.add(cid)
                         for i, ele in enumerate(chain):
                             if isinstance(ele, Text) and _PLACEHOLDER_RE.match(ele.text):
-                                chain[i] = Text("[Image: (description unavailable)]")
+                                _pmap[ele.text] = "[Image: (description unavailable)]"
                             elif isinstance(ele, Reply) and ele.chain is not None:
-                                _fix(ele.chain, visited)
+                                _collect(ele.chain, visited)
                             elif isinstance(ele, Forward) and ele.chains:
                                 for c in ele.chains:
-                                    _fix(c, visited)
-                    _fix(message.chain)
+                                    _collect(c, visited)
+
+                    _collect(message.chain)
+                    if _pmap:
+                        ParallelImageReader._replace_placeholders_in_chain(
+                            message.chain, _pmap
+                        )
         except Exception:
             pass
 
@@ -357,7 +424,7 @@ class ParallelImageReader(BasePlugin):
 
     async def _describe_parallel(self, images: list, session_key: str) -> list[str]:
         """Concurrent VLM calls with Semaphore + image_desc_cache."""
-        sem = asyncio.Semaphore(self.max_concurrent)
+        sem = self._sem
         db = self.ctx.db
 
         async def _one(idx: int, elem) -> str:

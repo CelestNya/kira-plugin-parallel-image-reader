@@ -1,8 +1,8 @@
 {
     "display_name": "并行识图插件",
     "plugin_id": "parallel_image_reader",
-    "version": "2.1.1",
+    "version": "2.2.0",
     "author": "CelestNya",
-    "description": "并发调用 VLM 并行描述图片，大幅降低多图场景回复延迟。支持 JPEG 压缩质量调节、图片描述缓存复用。",
+    "description": "并发调用 VLM 并行描述图片，大幅降低多图场景回复延迟。支持 JPEG 压缩质量调节、图片描述缓存复用、乐观加载模式（收到即识图，默认关闭）。",
     "repo": "https://github.com/CelestNya/kira-plugin-parallel-image-reader"
 }

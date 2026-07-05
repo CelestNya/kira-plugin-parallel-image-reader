@@ -13,5 +13,10 @@
         "type": "integer",
         "default": 85,
         "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效"
+    },
+    "eager_loading": {
+        "type": "switch",
+        "default": false,
+        "hint": "乐观加载：收到图片消息即开始识图，可降低首图延迟。被丢弃的消息也会消耗 VLM 调用，默认关闭"
     }
 }
