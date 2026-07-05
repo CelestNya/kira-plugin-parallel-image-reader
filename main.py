@@ -176,10 +176,10 @@ class ParallelImageReader(BasePlugin):
             if pending:
                 # 挂到 message 上，batch 阶段读取（message 实例在两阶段间是同一个对象）
                 event.message._pir_pending = pending
-            logger.info(
-                f"[ParallelImageReader] stashed {len(pending)} pending, "
-                f"{cached_count} cache-hit [{session_key}]"
-            )
+                logger.info(
+                    f"[ParallelImageReader] stashed {len(pending)} pending, "
+                    f"{cached_count} cache-hit [{session_key}]"
+                )
         except Exception as e:
             logger.error(
                 f"[ParallelImageReader] on_im_message failed [{session_key}]: "
@@ -212,10 +212,6 @@ class ParallelImageReader(BasePlugin):
 
             images = [item[2] for item in all_pending]
             mode = "quality" if self.quality_enabled else "native"
-            logger.info(
-                f"[ParallelImageReader] batch ({mode}) [{session_key}]: "
-                f"{len(images)} pending, concurrency={self.max_concurrent}"
-            )
 
             # 2. 并行 VLM
             descriptions = await self._describe_parallel(images, session_key)
@@ -239,7 +235,8 @@ class ParallelImageReader(BasePlugin):
                 self._replace_placeholders_in_chain(message.chain, placeholder_map)
 
             logger.info(
-                f"[ParallelImageReader] described {len(images)} images [{session_key}]"
+                f"[ParallelImageReader] described {len(images)} images "
+                f"({mode}, concurrency={self.max_concurrent}) [{session_key}]"
             )
         except Exception as e:
             logger.error(
@@ -323,42 +320,38 @@ class ParallelImageReader(BasePlugin):
     # ── VLM call with JPEG compression ──
 
     async def _vlm_call(self, pil_image: PILImage.Image, prompt: str, quality: int) -> str:
-        """Encode PIL Image as JPEG at *quality*, send to VLM, return text."""
+        """Encode PIL Image as JPEG at *quality*, send to VLM, return text.
+
+        静默失败——异常由调用方 _one 统一处理。
+        """
         w, h = pil_image.size
         prompt_preview = prompt[:80].replace("\n", " ")
-        vlm_logger.info(
+        vlm_logger.debug(
             f"[VLM] request | image={w}x{h} | quality={quality} | prompt={prompt_preview}..."
         )
-        try:
-            vlm = self.ctx.provider_mgr.get_default_vlm()
-            buf = io.BytesIO()
-            pil_image.save(buf, format="JPEG", quality=quality)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            data_url = f"data:image/jpeg;base64,{b64}"
+        vlm = self.ctx.provider_mgr.get_default_vlm()
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG", quality=quality)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        data_url = f"data:image/jpeg;base64,{b64}"
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            request = LLMRequest(messages=messages)
-            resp = await asyncio.wait_for(vlm.chat(request), timeout=VLM_TIMEOUT)
-            result = (resp.text_response or "").strip()
-            result_preview = result[:100].replace("\n", " ")
-            vlm_logger.info(
-                f"[VLM] response | len={len(result)} | {result_preview}..."
-            )
-            return result
-        except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
-                logger.warning(f"[ParallelImageReader] VLM timed out ({VLM_TIMEOUT}s)")
-            else:
-                logger.warning(f"[ParallelImageReader] VLM call failed: {type(e).__name__}: {e}")
-            return ""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        request = LLMRequest(messages=messages)
+        resp = await vlm.chat(request)
+        result = (resp.text_response or "").strip()
+        result_preview = result[:100].replace("\n", " ")
+        vlm_logger.debug(
+            f"[VLM] response | len={len(result)} | {result_preview}..."
+        )
+        return result
 
     # ── Parallel VLM ──
 
@@ -376,7 +369,7 @@ class ParallelImageReader(BasePlugin):
                 cached = await db.get_image_desc_cache(md5)
                 if cached and cached.get("description") and _is_valid_desc(cached["description"]):
                     desc = cached["description"]
-                    vlm_logger.info(
+                    vlm_logger.debug(
                         f"[VLM] #{idx + 1}/{len(images)} cache HIT [{session_key}] | "
                         f"md5={md5[:8]}... | {desc[:80].replace(chr(10), ' ')}..."
                     )
@@ -390,6 +383,10 @@ class ParallelImageReader(BasePlugin):
                         raw_b64 = data_url.split(",", 1)[1] if "," in data_url else data_url
                         buf = io.BytesIO(base64.b64decode(raw_b64))
                         pil_image = PILImage.open(buf).convert("RGB")
+                        vlm_logger.info(
+                            f"[VLM] #{idx + 1}/{len(images)} describing [{session_key}] "
+                            f"(quality={self.quality_value}, {pil_image.size[0]}x{pil_image.size[1]})"
+                        )
                         desc = await asyncio.wait_for(
                             self._vlm_call(pil_image, prompt, self.quality_value),
                             timeout=VLM_TIMEOUT,
@@ -397,15 +394,19 @@ class ParallelImageReader(BasePlugin):
                     else:
                         vlm = self.ctx.provider_mgr.get_default_vlm()
                         vlm_logger.info(
+                            f"[VLM] #{idx + 1}/{len(images)} describing [{session_key}] "
+                            f"(native, md5={md5[:8]}...)"
+                        )
+                        vlm_logger.debug(
                             f"[VLM] #{idx + 1}/{len(images)} desc_img [{session_key}] | "
-                            f"md5={md5[:8]}... | prompt={prompt[:60].replace(chr(10), ' ')}..."
+                            f"prompt={prompt[:60].replace(chr(10), ' ')}..."
                         )
                         desc = await asyncio.wait_for(
                             desc_img(client=vlm, image=elem, prompt=prompt),
                             timeout=VLM_TIMEOUT,
                         )
                         desc_preview = desc[:80].replace(chr(10), " ") if desc else "(empty)"
-                        vlm_logger.info(
+                        vlm_logger.debug(
                             f"[VLM] #{idx + 1}/{len(images)} done [{session_key}] | "
                             f"len={len(desc)} | {desc_preview}..."
                         )
