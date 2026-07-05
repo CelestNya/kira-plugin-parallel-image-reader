@@ -40,5 +40,5 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 启动 KiraAI，观察控制台输出：
 
 ```
-[parallel_vlm] [ParallelImageReader] initialized: max_concurrent=3, quality=off
+[parallel_vlm] [ParallelImageReader] v2.1.0 initialized: max_concurrent=3, quality=off
 ```

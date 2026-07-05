@@ -1,8 +1,9 @@
 """
-v2.0.0 生产级行为测试。stub 重依赖后加载真实 ParallelImageReader，零网络/DB 依赖。
-覆盖：链替换、缓存、嵌套、并发、超时、异常隔离、环检测。
+v2.1.0 两阶段架构测试。stub 重依赖后加载真实 ParallelImageReader，零网络/DB 依赖。
+覆盖：阶段1占位替换+暂存、阶段2并行VLM+message_str替换、缓存、嵌套、并发、超时、
+      异常隔离、环检测、discard 零 VLM。
 
-直接 `uv run python test_v2.py` 运行。
+直接 `python test_v2.py` 运行。
 """
 
 import sys
@@ -160,8 +161,64 @@ class FakeMessageChain(list):
 
 
 class FakeMessage:
-    def __init__(self, chain):
+    """模拟 KiraIMMessage — 有 chain 和 message_str，可挂自定义属性。"""
+    def __init__(self, chain, message_str=None):
         self.chain = FakeMessageChain(chain)
+        # _pir_pending 默认 None（模拟本体行为，插件会设置它）
+        self._pir_pending = None
+        # message_str 模拟本体 message_format_to_text 的输出
+        if message_str is not None:
+            self.message_str = message_str
+        else:
+            self.message_str = _simulate_format_to_text(chain)
+
+
+def _simulate_format_to_text(chain, _visited=None) -> str:
+    """模拟本体 message_format_to_text 的输出格式。
+
+    本体对 Image: caption is None → 调 VLM；caption is not None → 跳过 VLM，写缓存
+    输出格式: [Image {caption}, file_path: data/temp/xxx.jpg]
+    对 Sticker: [Sticker {caption}]
+    对 Text: {text}
+
+    带环检测：用 id(chain) 标记，避免 Reply 互引导致无限递归。
+    注意：阶段1已把 Image 替换为 Text(占位符)，所以本函数看到的是 Text。
+    """
+    if _visited is None:
+        _visited = set()
+    cid = id(chain)
+    if cid in _visited:
+        return "[cycle]"
+    _visited.add(cid)
+
+    parts = []
+    for ele in chain:
+        if isinstance(ele, Text):
+            parts.append(ele.text)
+        elif isinstance(ele, (Image, Sticker)):
+            # 阶段1未处理的情况（理论上不应出现，因为插件先于本体执行）
+            cap = getattr(ele, "caption", None)
+            if cap is None:
+                cap = "(vlm_desc)"
+            if isinstance(ele, Image):
+                parts.append(f"[Image {cap}, file_path: data/temp/fake.jpg]")
+            else:
+                parts.append(f"[Sticker {cap}]")
+        elif isinstance(ele, Reply):
+            if ele.chain:
+                inner = _simulate_format_to_text(ele.chain, _visited)
+                parts.append(f"[Reply ID: r1 content: {inner}]")
+            else:
+                parts.append("[Reply ID: r1]")
+        elif isinstance(ele, Forward):
+            if ele.chains:
+                contents = ""
+                for c in ele.chains:
+                    contents += f"\n{_simulate_format_to_text(c, _visited)}\n"
+                parts.append(f"[Forward {contents.strip()}]")
+        else:
+            parts.append(str(ele))
+    return "".join(parts)
 
 
 class FakeSession:
@@ -173,12 +230,22 @@ class FakeMessageEvent:
     """Mimics KiraMessageEvent — minimal fields plugin touches."""
     def __init__(self, chain, sid: str = "test_session"):
         self.session = FakeSession(sid)
-        self.message = FakeMessage(chain)
+        self.message = FakeMessage(chain, message_str="")
+
+
+class FakeBatchMessage:
+    """模拟 batch 中的单条消息。chain 是已经过阶段1处理的（Image→Text占位）。"""
+    def __init__(self, chain, message_str=None, _pir_pending=None):
+        self.chain = FakeMessageChain(chain)
+        self._pir_pending = _pir_pending
+        self.message_str = message_str if message_str is not None else _simulate_format_to_text(chain)
 
 
 class FakeMessageBatchEvent:
-    def __init__(self, sid: str = "test_session"):
+    """Mimics KiraMessageBatchEvent — minimal fields plugin touches."""
+    def __init__(self, messages, sid: str = "test_session"):
         self.session = FakeSession(sid)
+        self.messages = messages if isinstance(messages, list) else [messages]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -206,6 +273,11 @@ def load_plugin():
     class _on:
         @staticmethod
         def im_message(**k):
+            def deco(f): return f
+            return deco
+
+        @staticmethod
+        def im_batch_message(**k):
             def deco(f): return f
             return deco
 
@@ -273,6 +345,31 @@ def _chain_texts(chain) -> list[str]:
     return [ele.text if hasattr(ele, "text") else str(ele) for ele in chain]
 
 
+import re as _re
+_PH_RE = _re.compile(r"\x00PIR_[^\x00]+\x00")
+
+
+def _is_placeholder(text: str) -> bool:
+    """判断文本是否为占位符。"""
+    return bool(_PH_RE.match(text))
+
+
+def _make_batch_from_event(ev: FakeMessageEvent) -> FakeBatchMessage:
+    """从 FakeMessageEvent 构造 FakeBatchMessage，复用同一个 message 对象。
+
+    模拟本体 flush_session_messages 的行为：batch 里的 message 就是
+    ON_IM_MESSAGE 阶段的 event.message（同一个实例）。
+    """
+    msg = ev.message
+    # 重新生成 message_str（模拟本体 message_format_to_text，此时 chain 已含占位 Text）
+    msg.message_str = _simulate_format_to_text(msg.chain)
+    return FakeBatchMessage(
+        chain=msg.chain,
+        message_str=msg.message_str,
+        _pir_pending=getattr(msg, "_pir_pending", None),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # Tests
 # ═══════════════════════════════════════════════════════════════
@@ -304,191 +401,99 @@ def _check(cond, msg=""):
         raise AssertionError(msg or "assertion failed")
 
 
-# ── T1: Basic single image ──
+# ── 阶段 1: ON_IM_MESSAGE 占位替换测试 ──
 
-@_test("T1: single image → described & replaced")
+@_test("T1: on_im_message 缓存未命中 → 替换为占位符 + 暂存")
 async def _t1():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("一只猫"))
-    img = Image(md5="t1_md5")
+    img = Image(md5="t1_md5_0000000000000000000000ab")
     ev = FakeMessageEvent([img, Text("hello")])
 
     await plug.on_im_message(ev)
 
-    texts = _chain_texts(ev.message.chain)
-    _check(len(texts) == 2, f"expected 2 elements, got {len(texts)}")
-    _check("[Image: 一只猫" in texts[0], f"unexpected: {texts[0]}")
-    _check(texts[1] == "hello")
+    # Image 应被替换为 Text(占位符)
+    _check(isinstance(ev.message.chain[0], Text), "Image should be replaced by Text")
+    _check(_is_placeholder(ev.message.chain[0].text), f"not placeholder: {ev.message.chain[0].text!r}")
+    # 暂存到 _pir_pending
+    pending = getattr(ev.message, "_pir_pending", None)
+    _check(pending is not None and len(pending) == 1, f"pending={pending}")
+    # VLM 不应被调用
+    _check(plug.ctx.provider_mgr.get_default_vlm().call_count == 0, "VLM should not be called")
 
 
-# ── T2: Multiple images ──
-
-@_test("T2: multiple images → all described in parallel")
+@_test("T2: on_im_message 缓存命中 → 直接替换为 [Image: 描述]")
 async def _t2():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc", delay=0.05))
-    imgs = [Image(md5=f"t2_{i}") for i in range(3)]
-    ev = FakeMessageEvent(imgs)
+    db = FakeDB()
+    db.seed("t2_md5_0000000000000000000000ab", "cached cat")
+    plug, mod = await _make_plugin(db, FakeVLM("fresh"))
+    img = Image(md5="t2_md5_0000000000000000000000ab")
+    ev = FakeMessageEvent([img])
 
-    t0 = time.monotonic()
     await plug.on_im_message(ev)
-    elapsed = time.monotonic() - t0
 
-    texts = _chain_texts(ev.message.chain)
-    _check(len(texts) == 3, f"expected 3, got {len(texts)}")
-    for t in texts:
-        _check("[Image: desc" in t, f"unexpected: {t}")
-    # With concurrency=3, 3 images each 50ms → ~50ms, not 150ms
-    _check(elapsed < 0.12, f"took {elapsed:.3f}s, expected < 0.12s (parallel)")
+    _check(isinstance(ev.message.chain[0], Text), "should be Text")
+    _check("[Image: cached cat]" == ev.message.chain[0].text, f"got: {ev.message.chain[0].text}")
+    _check(plug.ctx.provider_mgr.get_default_vlm().call_count == 0)
+    # 不应有 pending
+    _check(getattr(ev.message, "_pir_pending", None) is None, "should not have pending")
 
 
-# ── T3: Cache hit ──
-
-@_test("T3: cache hit → skip VLM")
+@_test("T3: on_im_message 混合缓存命中/未命中")
 async def _t3():
     db = FakeDB()
-    db.seed("t3_md5", "cached description")
-    vlm = FakeVLM("fresh desc")
-    plug, mod = await _make_plugin(db, vlm)
-    img = Image(md5="t3_md5")
-    ev = FakeMessageEvent([img])
-
-    await plug.on_im_message(ev)
-
-    texts = _chain_texts(ev.message.chain)
-    _check(len(texts) == 1)
-    _check("[Image: cached description" in texts[0],
-           f"got: {texts[0]}")
-    _check(vlm.call_count == 0, f"VLM called {vlm.call_count} times (expected 0)")
-
-
-# ── T4: Cache miss → VLM → cached ──
-
-@_test("T4: cache miss → VLM called → desc cached")
-async def _t4():
-    db = FakeDB()
-    vlm = FakeVLM("fresh desc")
-    plug, mod = await _make_plugin(db, vlm)
-    img = Image(md5="t4_md5")
-    ev = FakeMessageEvent([img])
-
-    await plug.on_im_message(ev)
-
-    cached = await db.get_image_desc_cache("t4_md5")
-    _check(cached is not None, "not cached")
-    _check(cached["description"] == "fresh desc")
-    _check(vlm.call_count == 1)
-
-
-# ── T5: Mixed cache ──
-
-@_test("T5: mixed cache hit/miss")
-async def _t5():
-    db = FakeDB()
-    db.seed("hit_md5", "cached")
-    vlm = FakeVLM("fresh")
-    plug, mod = await _make_plugin(db, vlm)
-    img_hit = Image(md5="hit_md5")
-    img_miss = Image(md5="miss_md5")
+    db.seed("hit_md5_000000000000000000000000", "cached")
+    plug, mod = await _make_plugin(db, FakeVLM("fresh"))
+    img_hit = Image(md5="hit_md5_000000000000000000000000")
+    img_miss = Image(md5="miss_md5_00000000000000000000000a")
     ev = FakeMessageEvent([img_hit, img_miss])
 
     await plug.on_im_message(ev)
 
-    texts = _chain_texts(ev.message.chain)
-    _check(len(texts) == 2)
-    _check("[Image: cached" in texts[0], f"got: {texts[0]}")
-    _check("[Image: fresh" in texts[1], f"got: {texts[1]}")
-    _check(vlm.call_count == 1, f"VLM called {vlm.call_count} times (expected 1)")
+    _check("[Image: cached]" == ev.message.chain[0].text, f"hit: {ev.message.chain[0].text}")
+    _check(_is_placeholder(ev.message.chain[1].text), f"miss: {ev.message.chain[1].text}")
+    pending = getattr(ev.message, "_pir_pending", None)
+    _check(pending is not None and len(pending) == 1, f"pending={pending}")
 
 
-# ── T6: Image inside Reply ──
+@_test("T4: on_im_message 无图片 → 无操作")
+async def _t4():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    ev = FakeMessageEvent([Text("a"), Text("b")])
+    await plug.on_im_message(ev)
+    _check(isinstance(ev.message.chain[0], Text))
+    _check(isinstance(ev.message.chain[1], Text))
+    _check(getattr(ev.message, "_pir_pending", None) is None)
 
-@_test("T6: image inside Reply.chain")
-async def _t6():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM("猫"))
-    reply_img = Image(md5="reply_md5")
+
+@_test("T5: on_im_message 嵌套 Reply 中的图片被替换")
+async def _t5():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    reply_img = Image(md5="reply_md5_0000000000000000000000a")
     reply = Reply(chain=[Text("quote"), reply_img])
     ev = FakeMessageEvent([Text("forward"), reply])
 
     await plug.on_im_message(ev)
 
-    # Flat chain: Text("forward"), Reply(chain=[Text, Text])
-    # After replacement: Reply.chain[1] should be Text("[Image: 猫]")
-    _check(isinstance(ev.message.chain[0], Text), "first should be Text")
-    _check(isinstance(ev.message.chain[1], Reply), "second should be Reply")
-    _check(isinstance(ev.message.chain[1].chain[0], Text), "reply[0] Text")
-    _check(isinstance(ev.message.chain[1].chain[1], Text), "reply[1] Text")
-    _check("[Image: 猫" in ev.message.chain[1].chain[1].text,
-           f"got: {ev.message.chain[1].chain[1].text}")
+    _check(isinstance(reply.chain[1], Text), "reply image should be Text")
+    _check(_is_placeholder(reply.chain[1].text), f"not placeholder: {reply.chain[1].text!r}")
 
 
-# ── T7: Images inside Forward ──
-
-@_test("T7: images inside Forward.chains")
-async def _t7():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM("图"))
-    fwd = Forward(chains=[
-        [Image(md5="f1"), Text("a")],
-        [Text("b"), Image(md5="f2")],
-    ])
+@_test("T6: on_im_message 嵌套 Forward 中的图片被替换")
+async def _t6():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    f1 = Image(md5="f1_md5_0000000000000000000000000a")
+    f2 = Image(md5="f2_md5_0000000000000000000000000a")
+    fwd = Forward(chains=[[f1, Text("a")], [Text("b"), f2]])
     ev = FakeMessageEvent([fwd])
 
     await plug.on_im_message(ev)
 
-    fwd = ev.message.chain[0]
-    _check(isinstance(fwd, Forward))
-    c0 = fwd.chains[0]
-    c1 = fwd.chains[1]
-    _check("[Image: 图" in c0[0].text, f"c0[0]: {c0[0].text}")
-    _check(c0[1].text == "a")
-    _check(c1[0].text == "b")
-    _check("[Image: 图" in c1[1].text, f"c1[1]: {c1[1].text}")
+    _check(_is_placeholder(fwd.chains[0][0].text), f"f1: {fwd.chains[0][0].text!r}")
+    _check(_is_placeholder(fwd.chains[1][1].text), f"f2: {fwd.chains[1][1].text!r}")
 
 
-# ── T8: No images → 0 ──
-
-@_test("T8: no images → no op")
-async def _t8():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
-    ev = FakeMessageEvent([Text("a"), Text("b")])
-    await plug.on_im_message(ev)
-    texts = _chain_texts(ev.message.chain)
-    _check(texts == ["a", "b"], f"got: {texts}")
-
-
-# ── T9: VLM returns empty → fallback ──
-
-@_test("T9: VLM fails → (description unavailable)")
-async def _t9():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM(""))
-    img = Image(md5="t9_md5")
-    ev = FakeMessageEvent([img])
-
-    await plug.on_im_message(ev)
-
-    texts = _chain_texts(ev.message.chain)
-    _check("(description unavailable)" in texts[0],
-           f"got: {texts[0]}")
-
-
-# ── T10: Timeout → fallback ──
-
-@_test("T10: VLM timeout → (description unavailable)")
-async def _t10():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM("too slow", delay=99))
-    mod.VLM_TIMEOUT = 0.05  # force short timeout
-    img = Image(md5="t10_md5")
-    ev = FakeMessageEvent([img])
-
-    await plug.on_im_message(ev)
-
-    texts = _chain_texts(ev.message.chain)
-    _check("(description unavailable)" in texts[0],
-           f"got: {texts[0]}")
-
-
-# ── T11: Cycle detection ──
-
-@_test("T11: Reply cycle → no RecursionError")
-async def _t11():
+@_test("T7: on_im_message 环检测不崩溃")
+async def _t7():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
     r = Reply()
     r2 = Reply(chain=[r])
@@ -501,85 +506,385 @@ async def _t11():
         raise AssertionError("RecursionError not prevented by cycle detection")
 
 
-# ── T12: Event handler exception safety ──
-
-@_test("T12: bad event → caught, no crash")
-async def _t12():
+@_test("T8: on_im_message 异常事件不崩溃")
+async def _t8():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
-    ev = FakeMessageEvent("not_a_chain")  # intentionally broken
+    ev = FakeMessageEvent("not_a_chain")
     try:
         await plug.on_im_message(ev)
     except Exception:
         raise AssertionError("exception escaped on_im_message")
 
 
-# ── T13: Concurrent concurrency control ──
+# ── 阶段 2: ON_IM_BATCH_MESSAGE 并行 VLM + 替换测试 ──
 
-@_test("T13: concurrency=1 → sequential (total ~N*delay)")
+@_test("T9: batch 单图 → VLM 描述 + message_str 替换")
+async def _t9():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("一只猫"))
+    img = Image(md5="t9_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img, Text("hello")])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # message_str 中的占位符应被替换
+    _check("[Image: 一只猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
+    _check("\x00PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    # chain 中的占位 Text 也应被替换
+    _check("[Image: 一只猫]" == batch_msg.chain[0].text, f"chain[0]: {batch_msg.chain[0].text}")
+
+
+@_test("T10: batch 多图并行（3图50ms各 → ~50ms）")
+async def _t10():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc", delay=0.05))
+    imgs = [Image(md5=f"t10_{i}_" + "0" * 24) for i in range(3)]
+    ev = FakeMessageEvent(imgs)
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    t0 = time.monotonic()
+    await plug.on_im_batch_message(batch_ev)
+    elapsed = time.monotonic() - t0
+
+    # 3 个占位符都应被替换
+    _check("\x00PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    count = batch_msg.message_str.count("[Image: desc]")
+    _check(count == 3, f"expected 3, got {count}")
+    _check(elapsed < 0.12, f"took {elapsed:.3f}s, expected < 0.12s (parallel)")
+
+
+@_test("T11: batch 全部缓存命中 → 无 pending，message_str 仍正确")
+async def _t11():
+    db = FakeDB()
+    md5 = "t11_md5_00000000000000000000000a"
+    db.seed(md5, "cached description")
+    vlm = FakeVLM("fresh desc")
+    plug, mod = await _make_plugin(db, vlm)
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("[Image: cached description]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check(vlm.call_count == 0, f"VLM called {vlm.call_count} times (expected 0)")
+
+
+@_test("T12: batch cache miss → VLM → 写入缓存")
+async def _t12():
+    db = FakeDB()
+    md5 = "t12_md5_00000000000000000000000a"
+    vlm = FakeVLM("fresh desc")
+    plug, mod = await _make_plugin(db, vlm)
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    cached = await db.get_image_desc_cache(md5)
+    _check(cached is not None, "not cached")
+    _check(cached["description"] == "fresh desc")
+    _check(vlm.call_count == 1)
+
+
+@_test("T13: batch 混合缓存命中/未命中")
 async def _t13():
+    db = FakeDB()
+    db.seed("hit_md5_000000000000000000000000", "cached")
+    vlm = FakeVLM("fresh")
+    plug, mod = await _make_plugin(db, vlm)
+    img_hit = Image(md5="hit_md5_000000000000000000000000")
+    img_miss = Image(md5="miss_md5_0000000000000000000000a")
+    ev = FakeMessageEvent([img_hit, img_miss])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("[Image: cached]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image: fresh]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check(vlm.call_count == 1, f"VLM called {vlm.call_count} times (expected 1)")
+
+
+@_test("T14: batch VLM 返回空 → 降级")
+async def _t14():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM(""))
+    img = Image(md5="t14_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+@_test("T15: batch VLM 超时 → 降级")
+async def _t15():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("too slow", delay=99))
+    mod.VLM_TIMEOUT = 0.05
+    img = Image(md5="t15_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+@_test("T16: batch concurrency=1 → 串行（~N*delay）")
+async def _t16():
     db = FakeDB()
     vlm = FakeVLM("slow", delay=0.03)
     plug, mod = await _make_plugin(db, vlm, cfg={"max_concurrent": 1})
-    imgs = [Image(md5=f"t13_{i}") for i in range(3)]
+    imgs = [Image(md5=f"t16_{i}_" + "0" * 24) for i in range(3)]
     ev = FakeMessageEvent(imgs)
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
 
     t0 = time.monotonic()
-    await plug.on_im_message(ev)
+    await plug.on_im_batch_message(batch_ev)
     elapsed = time.monotonic() - t0
 
     _check(elapsed >= 0.07, f"too fast ({elapsed:.3f}s), expected >= 90ms (sequential)")
-    texts = _chain_texts(ev.message.chain)
-    _check(len(texts) == 3, f"got {len(texts)} elements")
+    count = batch_msg.message_str.count("[Image: slow]")
+    _check(count == 3, f"expected 3, got {count}")
 
 
-# ── T14: Quality path ──
-
-@_test("T14: quality_enabled path works")
-async def _t14():
+@_test("T17: batch quality_enabled 路径")
+async def _t17():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("quality desc"),
                              cfg={"quality_enabled": True, "quality_value": 50})
-    img = Image(md5="t14_md5")
+    img = Image(md5="t17_md5_00000000000000000000000a")
     ev = FakeMessageEvent([img])
-
     await plug.on_im_message(ev)
 
-    texts = _chain_texts(ev.message.chain)
-    _check("[Image: quality desc" in texts[0],
-           f"got: {texts[0]}")
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("[Image: quality desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
-# ── T15: Sticker (same as Image) ──
-
-@_test("T15: Sticker element → described")
-async def _t15():
+@_test("T18: batch Sticker 元素 → 描述")
+async def _t18():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("sticker desc"))
-    st = Sticker(md5="t15_md5")
+    st = Sticker(md5="t18_md5_00000000000000000000000a")
     ev = FakeMessageEvent([st])
-
     await plug.on_im_message(ev)
 
-    texts = _chain_texts(ev.message.chain)
-    _check("[Image: sticker desc" in texts[0],
-           f"got: {texts[0]}")
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("[Image: sticker desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
-# ── T16: Empty chain → no errors ──
-
-@_test("T16: empty chain → no error, 0 images")
-async def _t16():
+@_test("T19: batch 空 chain → 无错误")
+async def _t19():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
-    ev = FakeMessageEvent([])
+    batch_msg = FakeBatchMessage([])
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+    _check(len(batch_msg.chain) == 0)
+
+
+@_test("T20: batch 嵌套 Reply 中的图片 → 描述+替换")
+async def _t20():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("猫"))
+    reply_img = Image(md5="reply_md5_0000000000000000000000a")
+    reply = Reply(chain=[Text("quote"), reply_img])
+    ev = FakeMessageEvent([Text("forward"), reply])
     await plug.on_im_message(ev)
-    _check(isinstance(ev.message.chain, FakeMessageChain))
-    _check(len(ev.message.chain) == 0)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # Reply.chain[1] 应从 Text(占位符) 变为 Text("[Image: 猫]")
+    _check("[Image: 猫]" == batch_msg.chain[1].chain[1].text,
+           f"got: {batch_msg.chain[1].chain[1].text}")
+    _check("[Image: 猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
 
 
-# ── T17: on_llm_request system hint injection ──
+@_test("T21: batch 嵌套 Forward 中的图片 → 描述+替换")
+async def _t21():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("图"))
+    f1 = Image(md5="f1_md5_0000000000000000000000000a")
+    f2 = Image(md5="f2_md5_0000000000000000000000000a")
+    fwd = Forward(chains=[[f1, Text("a")], [Text("b"), f2]])
+    ev = FakeMessageEvent([fwd])
+    await plug.on_im_message(ev)
 
-@_test("T17: on_llm_request injects system hint")
-async def _t17():
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    fwd = batch_msg.chain[0]
+    _check("[Image: 图]" == fwd.chains[0][0].text, f"c0[0]: {fwd.chains[0][0].text}")
+    _check("[Image: 图]" == fwd.chains[1][1].text, f"c1[1]: {fwd.chains[1][1].text}")
+    _check(batch_msg.message_str.count("[Image: 图]") == 2, f"message_str: {batch_msg.message_str}")
+
+
+@_test("T22: batch Sticker 嵌套 Forward → 描述+替换")
+async def _t22():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("图"))
+    st = Sticker(md5="s1_md5_0000000000000000000000000a")
+    fwd = Forward(chains=[[st, Text("a")]])
+    ev = FakeMessageEvent([fwd])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    c0 = batch_msg.chain[0].chains[0]
+    _check("[Image: 图]" == c0[0].text, f"got: {c0[0].text}")
+
+
+@_test("T23: batch 环检测不崩溃")
+async def _t23():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
-    fake_batch_ev = FakeMessageBatchEvent("test")
+    r = Reply()
+    r2 = Reply(chain=[r])
+    r.chain = [r2]
+    ev = FakeMessageEvent([r])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    try:
+        await plug.on_im_batch_message(batch_ev)
+    except RecursionError:
+        raise AssertionError("RecursionError not prevented in batch")
+
+
+@_test("T24: batch 异常事件不崩溃")
+async def _t24():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    batch_ev = FakeMessageBatchEvent("not_messages")
+    try:
+        await plug.on_im_batch_message(batch_ev)
+    except Exception:
+        raise AssertionError("exception escaped on_im_batch_message")
+
+
+# ── 占位符不泄漏测试 ──
+
+@_test("T25: 占位符不泄漏到 message_str（正常流程）")
+async def _t25():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("猫"))
+    img = Image(md5="t25_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img, Text("hello")])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("\x00PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+    _check("[Image: 猫]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+@_test("T26: 占位符不泄漏到 message_str（缓存命中）")
+async def _t26():
+    db = FakeDB()
+    md5 = "t26_md5_00000000000000000000000a"
+    db.seed(md5, "cached desc")
+    plug, mod = await _make_plugin(db, FakeVLM("fresh"))
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    _check("\x00PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+    _check("[Image: cached desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+
+
+@_test("T27: 占位符不泄漏到 message_str（异常兜底）")
+async def _t27():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    img = Image(md5="t27_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    # 故意破坏 _pir_pending，触发异常路径
+    batch_msg._pir_pending = "broken"
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    try:
+        await plug.on_im_batch_message(batch_ev)
+    except Exception:
+        pass  # 异常应被捕获
+
+    _check("\x00PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
+
+
+# ── discard 零 VLM 测试 ──
+
+@_test("T28: discard 的消息不做 VLM（不进入 batch）")
+async def _t28():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm)
+    img = Image(md5="t28_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    # 阶段1替换为占位符
+    await plug.on_im_message(ev)
+    _check(vlm.call_count == 0, "VLM should not be called in stage 1")
+    # 模拟消息被 discard：不进入 batch，不调用 on_im_batch_message
+    _check(vlm.call_count == 0, f"VLM called {vlm.call_count} times for discarded msg")
+
+
+@_test("T29: batch 多消息批量处理")
+async def _t29():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc", delay=0.02))
+    img1 = Image(md5="t29_1_md5_00000000000000000000000a")
+    img2 = Image(md5="t29_2_md5_00000000000000000000000a")
+    ev1 = FakeMessageEvent([img1, Text("msg1")])
+    ev2 = FakeMessageEvent([img2, Text("msg2")])
+    await plug.on_im_message(ev1)
+    await plug.on_im_message(ev2)
+
+    batch_msg1 = _make_batch_from_event(ev1)
+    batch_msg2 = _make_batch_from_event(ev2)
+    batch_ev = FakeMessageBatchEvent([batch_msg1, batch_msg2])
+
+    t0 = time.monotonic()
+    await plug.on_im_batch_message(batch_ev)
+    elapsed = time.monotonic() - t0
+
+    # 两图并行（concurrency=3），20ms 各 → ~20ms
+    _check(elapsed < 0.06, f"took {elapsed:.3f}s, expected < 0.06s (parallel batch)")
+    _check("[Image: desc]" in batch_msg1.message_str, f"msg1: {batch_msg1.message_str}")
+    _check("[Image: desc]" in batch_msg2.message_str, f"msg2: {batch_msg2.message_str}")
+
+
+# ── on_llm_request system hint 测试 ──
+
+@_test("T30: on_llm_request 注入 system hint")
+async def _t30():
+    plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
+    fake_batch_ev = FakeMessageBatchEvent([])
     fake_prompt = types.SimpleNamespace(name="chat_env", content="")
     req = LLMRequest(system_prompt=[fake_prompt])
 
@@ -589,19 +894,58 @@ async def _t17():
            f"hint not injected: {fake_prompt.content}")
 
 
-# ── T18: Sticker in Forward ──
+# ── 缓存不被污染测试（回归 v2.1.0 caption 方案的 bug）──
 
-@_test("T18: Sticker inside Forward.chains")
-async def _t18():
-    plug, mod = await _make_plugin(FakeDB(), FakeVLM("图"))
-    fwd = Forward(chains=[
-        [Sticker(md5="s1"), Text("a")],
-    ])
-    ev = FakeMessageEvent([fwd])
+@_test("T31: 缓存不被占位符污染")
+async def _t31():
+    db = FakeDB()
+    md5 = "t31_md5_00000000000000000000000a"
+    vlm = FakeVLM("real desc")
+    plug, mod = await _make_plugin(db, vlm)
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
     await plug.on_im_message(ev)
-    c0 = ev.message.chain[0].chains[0]
-    _check("[Image: 图" in c0[0].text, f"got: {c0[0].text}")
-    _check(c0[1].text == "a")
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # 缓存中应是真实描述，不是占位符
+    cached = await db.get_image_desc_cache(md5)
+    _check(cached is not None, "not cached")
+    _check(cached["description"] == "real desc", f"cached: {cached['description']!r}")
+    _check("\x00PIR" not in cached["description"], f"cache polluted: {cached['description']!r}")
+
+
+@_test("T32: 污染缓存（含\\x00）被忽略，走 VLM")
+async def _t32():
+    db = FakeDB()
+    md5 = "t32_md5_00000000000000000000000a"
+    # 模拟被旧版 caption 方案污染的缓存条目
+    db.seed(md5, "\x00IMG_PENDING_t32_md5_00000000000000000000000a")
+    vlm = FakeVLM("fresh real desc")
+    plug, mod = await _make_plugin(db, vlm)
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    # 污染缓存应被忽略，图片走 pending（占位符），不是 [Image: 污染数据]
+    _check(isinstance(ev.message.chain[0], Text), "should be Text")
+    _check(_is_placeholder(ev.message.chain[0].text),
+           f"polluted cache should be ignored, got: {ev.message.chain[0].text!r}")
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)
+
+    # VLM 应被调用
+    _check(vlm.call_count == 1, f"VLM should be called, got {vlm.call_count}")
+    # 最终描述应是真实描述
+    _check("[Image: fresh real desc]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str}")
+    # 缓存应被正确覆写
+    cached = await db.get_image_desc_cache(md5)
+    _check(cached["description"] == "fresh real desc", f"cached: {cached['description']!r}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -609,14 +953,27 @@ async def _t18():
 # ═══════════════════════════════════════════════════════════════
 
 _TESTS = [
-    _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10,
-    _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18,
+    # 阶段1
+    _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8,
+    # 阶段2
+    _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19,
+    _t20, _t21, _t22, _t23, _t24,
+    # 占位符不泄漏
+    _t25, _t26, _t27,
+    # discard + batch
+    _t28, _t29,
+    # hint
+    _t30,
+    # 缓存不污染
+    _t31,
+    # 污染缓存忽略
+    _t32,
 ]
 
 
 def main():
     global _PASS, _FAIL, _SKIP
-    print(f"\nParallel Image Reader v2.0.0 — 生产级行为测试\n")
+    print(f"\nParallel Image Reader v2.1.0 — 两阶段架构测试\n")
     print(f"共 {len(_TESTS)} 个测试\n")
 
     asyncio.run(_run_all())

@@ -1,14 +1,18 @@
 # Parallel Image Reader — 并行识图插件
 
-**KiraAI 插件** — 拦截 IM 消息中的图片，并发调用 VLM 描述后直接替换为文字，历史记录清洁无污染。
+**KiraAI 插件** — 两阶段并行识图，既不污染聊天历史，也不浪费 VLM 调用。
 
 ## 解决的问题
 
 KiraAI 原生按顺序处理图片：N 张图 = N 次串行 VLM 调用。多图场景下延迟叠加严重。
 
-本插件：
+此前版本（v2.0.x）在 `ON_IM_MESSAGE` 阶段就调 VLM——但此时 chat 插件尚未决定消息命运，被 `discard` 的图片白白浪费了 VLM 调用。
+
+本插件（v2.1.0）采用**两阶段架构**：
 - **并发读图**：Semaphore + `asyncio.gather` 并发调用 VLM
-- **零历史污染**：`ON_IM_MESSAGE` 时直接完成描述并替换为 `[Image: 描述]` 文字，写入历史的就是纯文字
+- **零历史污染**：图片替换为 `[Image: 描述]` 文字后写入历史，纯文本无占位符
+- **零 VLM 浪费**：仅在 `ON_IM_BATCH_MESSAGE`（确定会发给 LLM）时才调 VLM，被 `discard` 的消息零开销
+- **阻止本体串行**：`ON_IM_MESSAGE` 阶段给 Image 设 caption 占位标记，让本体 `message_format_to_text` 跳过 VLM
 - **缓存复用**：使用 KiraAI 内置 `image_desc_cache`，相同图片秒回
 - **VLM 超时保护**：单次调用超时 60 秒，超时自动降级
 
@@ -46,16 +50,25 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 ## 工作流程
 
 ```
-IM 消息 → [ON_IM_MESSAGE] 遍历 chain
-                            ├─ 找到 Image/Sticker → hash 查缓存
-                            │                       ├─ HIT  → 直接用已有描述
-                            │                       └─ MISS → Semaphore × N 次 VLM
-                            │                                 ├─ 原生模式 → desc_img
-                            │                                 └─ 质量模式 → JPEG 压缩 → VLM
-                            │                                 ↓ 写入缓存
-                            └─ chain[i] = Text("[Image: 描述]") → 写入历史已是纯文字
+阶段1  IM 消息 → [ON_IM_MESSAGE] (优先级 SYS_HIGH-1, 早于 chat 插件)
+                    ├─ 递归遍历 chain（含 Reply/Forward 嵌套，带环检测）
+                    ├─ Image/Sticker → hash 查缓存
+                    │                 ├─ HIT  → 替换为 Text("[Image: 描述]")
+                    │                 └─ MISS → 替换为 Text(占位符)，原图暂存到 message._pir_pending
+                    └─ 不调 VLM、不干预 event 策略
 
-LLM 请求 → 无事可做，历史已清洁
+       chat 插件决定 discard / buffer / flush
+                    ├─ discard → 消息终止，零 VLM 开销 ✅
+                    └─ buffer/flush → 进入 batch 处理 ↓
+
+阶段2  批量消息 → [ON_IM_BATCH_MESSAGE] (优先级 SYS_HIGH-1)
+                    ├─ 本体 message_format_to_text 已执行（占位 Text 不触发 VLM）
+                    ├─ 读取各 message._pir_pending，收集所有暂存图片
+                    ├─ Semaphore + gather 并行 VLM（原生模式 / 质量模式）
+                    ├─ 替换 message_str 中的占位符 → [Image: 描述]（持久化前，不进历史）
+                    └─ 替换 chain 中的占位 Text → Text("[Image: 描述]")
+
+LLM 请求 → [ON_LLM_REQUEST] 注入 system hint 说明 [Image: ...] 格式
 ```
 
 ## 日志
@@ -68,6 +81,7 @@ LLM 请求 → 无事可做，历史已清洁
 
 ## 版本记录
 
+- **v2.1.0** — 两阶段架构：ON_IM_MESSAGE 标记占位 + ON_IM_BATCH_MESSAGE 并行填充，discard 消息零 VLM
 - **v2.0.1** — 清理冗余代码、README 更新
 - **v2.0.0** — 重构：VLM 移至 on_im_message 内联替换，移除 stash/__IMG__ 机制
 - **v1.1.0** — 并行识别、缓存、质量压缩

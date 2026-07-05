@@ -1,15 +1,27 @@
 """
-并行识别插件 v2.0.1 — Parallel Image Reader
+并行识图插件 v2.1.0 — Parallel Image Reader
 
-在 on_im_message 阶段拦截 Image/Sticker，并行调 VLM 生成描述后直接
-替换为 Text 元素，写入历史的就是纯文字，无需 on_llm_request 二次替换。
+两阶段架构，既不污染聊天历史，也不浪费 VLM 调用：
 
-配置项见 schema.json（无 schema 变更，仅 manifest 版本号 → 2.0.0）
+1. ON_IM_MESSAGE（优先级 SYS_HIGH-1，早于 chat 插件 HIGH）
+   递归遍历消息链，把 Image/Sticker 替换为 Text 占位符（阻止本体
+   message_format_to_text 串行调 VLM），图片元素暂存到 message 的
+   _pir_pending 属性。不调 VLM、不干预 event 策略。被 discard 的消息
+   零 VLM 开销。
+
+2. ON_IM_BATCH_MESSAGE（优先级 SYS_HIGH-1）
+   此时消息已确定会发给 LLM，本体 message_format_to_text 已执行（占位
+   Text 不触发 VLM）。插件并行描述所有暂存图片，替换 message_str 中的
+   占位符为 [Image: 描述]，同时替换 chain 元素。message_str 在持久化
+   之前被修正，占位符不进入历史。
+
+配置项见 schema.json。
 """
 
 import asyncio
 import base64
 import io
+import re
 
 from PIL import Image as PILImage
 
@@ -29,9 +41,20 @@ DESC_PROMPT = "描述这张图片的内容，如果有文字请将其输出"
 # 单次 VLM 调用超时（秒），超时返回空描述 → "(description unavailable)"
 VLM_TIMEOUT = 60
 
+# 占位符：替换 chain 中的 Image/Sticker，阻止本体 message_format_to_text 调 VLM。
+# 格式 \x00PIR_{md5}\x00 —— 不可见控制字符 + 图片标识，保证唯一且不与正常文本冲突。
+# 在 ON_IM_BATCH_MESSAGE 阶段（持久化之前）被替换为真实描述，不进入历史。
+# md5 可能是任意 hash_image() 返回的字符串，用非贪婪匹配。
+_PLACEHOLDER_RE = re.compile(r"\x00PIR_[^\x00]+\x00")
+
+
+def _make_placeholder(md5: str) -> str:
+    """生成占位符文本。"""
+    return f"\x00PIR_{md5}\x00"
+
 
 class ParallelImageReader(BasePlugin):
-    """并行识别插件 v2.0.1"""
+    """并行识图插件 v2.1.0 — 两阶段架构"""
 
     def __init__(self, ctx: PluginContext, cfg: dict):
         super().__init__(ctx, cfg)
@@ -50,7 +73,7 @@ class ParallelImageReader(BasePlugin):
         self.quality_value = self.plugin_cfg.get("quality_value", 85)
 
         logger.info(
-            f"[ParallelImageReader] v2.0.1 initialized: "
+            f"[ParallelImageReader] v2.1.0 initialized: "
             f"max_concurrent={self.max_concurrent}, "
             f"quality={'on(' + str(self.quality_value) + ')' if self.quality_enabled else 'off'}"
         )
@@ -58,46 +81,231 @@ class ParallelImageReader(BasePlugin):
     async def terminate(self):
         logger.info("[ParallelImageReader] terminated")
 
-    # ── Chain processing ──
+    # ── Chain traversal ──
 
-    async def _process_chain(self, chain, session_key: str) -> int:
-        """Traverse chain tree, describe Image/Sticker via VLM in parallel,
-        replace each with Text element. Returns count processed."""
-        images: list = []
-        positions: list[tuple] = []
+    @staticmethod
+    def _walk(chain, visited=None):
+        """递归遍历消息链（含 Reply.chain / Forward.chains），yield (chain_ref, index)。
 
-        def _collect(chain_ref, _visited=None):
-            if _visited is None:
-                _visited = set()
-            cid = id(chain_ref)
-            if cid in _visited:
-                logger.warning(
-                    f"[ParallelImageReader] cycle detected in message chain "
-                    f"[{session_key}], skipping"
-                )
+        带环检测：用 id(chain_ref) 标记已访问，避免 Reply 互引导致 RecursionError。
+        """
+        if visited is None:
+            visited = set()
+        cid = id(chain)
+        if cid in visited:
+            return
+        visited.add(cid)
+        for i, ele in enumerate(chain):
+            if isinstance(ele, (Image, Sticker)):
+                yield chain, i
+            elif isinstance(ele, Reply) and ele.chain is not None:
+                yield from ParallelImageReader._walk(ele.chain, visited)
+            elif isinstance(ele, Forward) and ele.chains:
+                for c in ele.chains:
+                    yield from ParallelImageReader._walk(c, visited)
+
+    # ── Stage 1: ON_IM_MESSAGE — replace with placeholder, stash originals ──
+
+    @on.im_message(priority=Priority.SYS_HIGH - 1)
+    async def on_im_message(self, event: KiraMessageEvent):
+        """把 Image/Sticker 替换为 Text 占位符，原图暂存到 message._pir_pending。
+
+        不调 VLM、不干预 event 策略。被 discard 的消息零 VLM 开销。
+        """
+        session_key = event.session.sid if event.session else "default"
+        try:
+            db = self.ctx.db
+            # 暂存：(placeholder, image_element, md5) 列表，挂在 message 上
+            pending: list = []
+            cached_count = 0
+
+            for chain_ref, idx in self._walk(event.message.chain):
+                ele = chain_ref[idx]
+                try:
+                    md5 = await ele.hash_image()
+                except Exception as e:
+                    logger.debug(
+                        f"[ParallelImageReader] hash failed [{session_key}]: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    md5 = None
+
+                # 查缓存：命中则直接用描述做占位符（后续无需 VLM）
+                # 防御：描述含 \x00 控制字符的视为无效（历史污染数据），不当作命中
+                desc_cached = None
+                if md5:
+                    try:
+                        entry = await db.get_image_desc_cache(md5)
+                        if entry and entry.get("description"):
+                            raw_desc = entry["description"]
+                            if "\x00" not in raw_desc:
+                                desc_cached = raw_desc
+                                cached_count += 1
+                            else:
+                                logger.warning(
+                                    f"[ParallelImageReader] cache polluted [{session_key}] "
+                                    f"md5={md5[:8]}... ignoring invalid cached desc"
+                                )
+                    except Exception as e:
+                        logger.debug(
+                            f"[ParallelImageReader] cache query failed [{session_key}]: {e}"
+                        )
+
+                if desc_cached is not None:
+                    # 缓存命中：直接替换为 [Image: 描述]，无需进 batch 阶段
+                    chain_ref[idx] = Text(f"[Image: {desc_cached}]")
+                else:
+                    # 缓存未命中：替换为占位符，暂存原图供 batch 阶段 VLM
+                    placeholder = _make_placeholder(md5 or f"noid_{id(ele)}")
+                    chain_ref[idx] = Text(placeholder)
+                    pending.append((placeholder, ele, md5))
+
+            if pending:
+                # 挂到 message 上，batch 阶段读取（message 实例在两阶段间是同一个对象）
+                event.message._pir_pending = pending
+            logger.info(
+                f"[ParallelImageReader] stashed {len(pending)} pending, "
+                f"{cached_count} cache-hit [{session_key}]"
+            )
+        except Exception as e:
+            logger.error(
+                f"[ParallelImageReader] on_im_message failed [{session_key}]: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ── Stage 2: ON_IM_BATCH_MESSAGE — parallel VLM + replace placeholders ──
+
+    @on.im_batch_message(priority=Priority.SYS_HIGH - 1)
+    async def on_im_batch_message(self, event: KiraMessageBatchEvent):
+        """并行描述暂存图片，替换 message_str 和 chain 中的占位符为 [Image: 描述]。
+
+        此时本体 message_format_to_text 已执行完毕（占位 Text 不触发 VLM）。
+        message_str 在持久化之前被修正，占位符不进入历史。
+        """
+        session_key = event.session.sid if event.session else "default"
+        try:
+            # 1. 收集所有 pending 图片
+            all_pending: list = []  # [(message, placeholder, ele, md5), ...]
+            for message in event.messages:
+                pending = getattr(message, "_pir_pending", None)
+                if pending:
+                    for placeholder, ele, md5 in pending:
+                        all_pending.append((message, placeholder, ele, md5))
+
+            if not all_pending:
+                # 全部缓存命中或无图片——仍需清理可能残留的占位符
+                self._cleanup_placeholders(event)
                 return
-            _visited.add(cid)
-            for i, ele in enumerate(chain_ref):
-                if isinstance(ele, (Image, Sticker)):
-                    images.append(ele)
-                    positions.append((chain_ref, i))
-                elif isinstance(ele, Reply) and ele.chain is not None:
-                    _collect(ele.chain, _visited)
-                elif isinstance(ele, Forward) and ele.chains:
-                    for c in ele.chains:
-                        _collect(c, _visited)
 
-        _collect(chain)
+            images = [item[2] for item in all_pending]
+            mode = "quality" if self.quality_enabled else "native"
+            logger.info(
+                f"[ParallelImageReader] batch ({mode}) [{session_key}]: "
+                f"{len(images)} pending, concurrency={self.max_concurrent}"
+            )
 
-        if not images:
-            return 0
+            # 2. 并行 VLM
+            descriptions = await self._describe_parallel(images, session_key)
 
-        descriptions = await self._describe_images(images, session_key)
+            # 3. 按 message 分组替换
+            #    placeholder → 最终 [Image: 描述] 文本
+            placeholder_map: dict[str, str] = {}
+            for (message, placeholder, ele, md5), desc in zip(all_pending, descriptions):
+                final = f"[Image: {desc or '(description unavailable)'}]"
+                placeholder_map[placeholder] = final
 
-        for (chain_ref, idx), desc in zip(positions, descriptions):
-            chain_ref[idx] = Text(f"[Image: {desc or '(description unavailable)'}]")
+            # 4. 替换每个 message 的 message_str 和 chain
+            for message in event.messages:
+                # 修 message_str（持久化前，占位符不进历史）
+                if message.message_str:
+                    for ph, final in placeholder_map.items():
+                        message.message_str = message.message_str.replace(ph, final)
+                # 修 chain 元素（占位 Text → 真实描述 Text）
+                #    _walk 只遍历 Image/Sticker，阶段1已替换为 Text，
+                #    所以这里单独遍历所有 Text 检查是否为占位符
+                self._replace_placeholders_in_chain(message.chain, placeholder_map)
 
-        return len(images)
+            logger.info(
+                f"[ParallelImageReader] described {len(images)} images [{session_key}]"
+            )
+        except Exception as e:
+            logger.error(
+                f"[ParallelImageReader] on_im_batch_message failed [{session_key}]: "
+                f"{type(e).__name__}: {e}"
+            )
+            # 兜底：确保占位符不泄漏到历史
+            self._cleanup_placeholders(event)
+
+    # ── 占位符清理（兜底）──
+
+    @staticmethod
+    def _replace_placeholders_in_chain(chain, placeholder_map: dict, visited=None):
+        """递归遍历 chain（含 Reply/Forward），把占位 Text 替换为真实描述 Text。"""
+        if visited is None:
+            visited = set()
+        cid = id(chain)
+        if cid in visited:
+            return
+        visited.add(cid)
+        for i, ele in enumerate(chain):
+            if isinstance(ele, Text) and ele.text in placeholder_map:
+                chain[i] = Text(placeholder_map[ele.text])
+            elif isinstance(ele, Reply) and ele.chain is not None:
+                ParallelImageReader._replace_placeholders_in_chain(ele.chain, placeholder_map, visited)
+            elif isinstance(ele, Forward) and ele.chains:
+                for c in ele.chains:
+                    ParallelImageReader._replace_placeholders_in_chain(c, placeholder_map, visited)
+
+    @staticmethod
+    def _cleanup_placeholders(event: KiraMessageBatchEvent):
+        """把所有 message_str 和 chain 中残留的占位符替换为降级文本。"""
+        try:
+            for message in event.messages:
+                # 修 message_str
+                if hasattr(message, "message_str") and message.message_str:
+                    message.message_str = _PLACEHOLDER_RE.sub(
+                        "(description unavailable)", message.message_str
+                    )
+                # 修 chain 元素（递归遍历找占位 Text）
+                if hasattr(message, "chain"):
+                    def _fix(chain, visited=None):
+                        if visited is None:
+                            visited = set()
+                        cid = id(chain)
+                        if cid in visited:
+                            return
+                        visited.add(cid)
+                        for i, ele in enumerate(chain):
+                            if isinstance(ele, Text) and _PLACEHOLDER_RE.match(ele.text):
+                                chain[i] = Text("[Image: (description unavailable)]")
+                            elif isinstance(ele, Reply) and ele.chain is not None:
+                                _fix(ele.chain, visited)
+                            elif isinstance(ele, Forward) and ele.chains:
+                                for c in ele.chains:
+                                    _fix(c, visited)
+                    _fix(message.chain)
+        except Exception:
+            pass
+
+    # ── System hint injection ──
+
+    @on.llm_request(priority=Priority.SYS_HIGH - 1)
+    async def on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        """注入 system hint 说明 [Image: ...] 格式。
+
+        图片描述已在 ON_IM_BATCH_MESSAGE 阶段替换完毕并写入 message_str，
+        此 handler 仅注入格式说明，不触碰图片内容。
+        """
+        hint = (
+            "当消息中包含 [Image: 描述内容] 格式的标记时，"
+            "这表示用户发送了一张图片，其内容由「描述内容」说明。"
+        )
+        for p in req.system_prompt:
+            if getattr(p, "name", None) == "chat_env":
+                if hint not in p.content:
+                    p.content += "\n" + hint
+                return
+        vlm_logger.debug("no chat_env prompt found to inject image description hint")
 
     # ── VLM call with JPEG compression ──
 
@@ -150,8 +358,10 @@ class ParallelImageReader(BasePlugin):
             try:
                 md5 = await elem.hash_image()
 
+                # 双重检查缓存（on_im_message 已查过，但可能并发刷新）
+                # 防御：描述含 \x00 控制字符的视为无效（历史污染数据）
                 cached = await db.get_image_desc_cache(md5)
-                if cached and cached.get("description"):
+                if cached and cached.get("description") and "\x00" not in cached["description"]:
                     desc = cached["description"]
                     vlm_logger.info(
                         f"[VLM] #{idx + 1}/{len(images)} cache HIT [{session_key}] | "
@@ -214,61 +424,3 @@ class ParallelImageReader(BasePlugin):
             return_exceptions=True,
         )
         return [r if isinstance(r, str) else "" for r in results]
-
-    # ── VLM dispatch ──
-
-    async def _describe_images(self, images: list, session_key: str) -> list[str]:
-        """Always parallel — dispatch point kept for future expansion."""
-        mode = "quality" if self.quality_enabled else "native"
-        logger.info(
-            f"[ParallelImageReader] parallel mode ({mode}) [{session_key}]: "
-            f"{len(images)} images, concurrency={self.max_concurrent}"
-        )
-        return await self._describe_parallel(images, session_key)
-
-    # ── Event: IM message ──
-
-    @on.im_message(priority=Priority.SYS_HIGH - 1)
-    async def on_im_message(self, event: KiraMessageEvent):
-        """Intercept IM messages: describe images via VLM, replace with Text."""
-        session_key = event.session.sid if event.session else "default"
-        try:
-            n = await self._process_chain(event.message.chain, session_key)
-            if n > 0:
-                logger.info(
-                    f"[ParallelImageReader] described {n} images [{session_key}]"
-                )
-        except Exception as e:
-            logger.error(
-                f"[ParallelImageReader] on_im_message failed [{session_key}]: "
-                f"{type(e).__name__}: {e}"
-            )
-
-    # ── Event: LLM request ──
-
-    @on.llm_request(priority=Priority.SYS_HIGH - 1)
-    async def on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
-        """Inject system hint explaining the [Image: ...] format."""
-        session_key = event.session.sid if event.session else "default"
-        try:
-            self._inject_system_hint(req)
-        except Exception as e:
-            logger.error(
-                f"[ParallelImageReader] on_llm_request failed [{session_key}]: "
-                f"{type(e).__name__}: {e}"
-            )
-
-    @staticmethod
-    def _inject_system_hint(req: LLMRequest):
-        """Add a short note to system prompt explaining the [Image: ...] format."""
-        hint = (
-            "当消息中包含 [Image: 描述内容] 格式的标记时，"
-            "这表示用户发送了一张图片，其内容由「描述内容」说明。"
-        )
-        for p in req.system_prompt:
-            if getattr(p, "name", None) == "chat_env":
-                if hint not in p.content:
-                    p.content += "\n" + hint
-                break
-        else:
-            vlm_logger.debug("no chat_env prompt found to inject image description hint")
