@@ -1,22 +1,38 @@
 {
     "max_concurrent": {
         "type": "integer",
+        "name": "最大并发数",
         "default": 3,
-        "hint": "最大并发 VLM 调用数"
+        "hint": "最大并发 VLM 调用数",
+        "locales": {
+            "zh": { "name": "最大并发数", "hint": "最大并发 VLM 调用数" }
+        }
     },
     "quality_enabled": {
         "type": "switch",
+        "name": "JPEG 压缩",
         "default": false,
-        "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）"
+        "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）",
+        "locales": {
+            "zh": { "name": "JPEG 压缩", "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）" }
+        }
     },
     "quality_value": {
         "type": "integer",
+        "name": "压缩质量",
         "default": 85,
-        "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效"
+        "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效",
+        "locales": {
+            "zh": { "name": "压缩质量", "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效" }
+        }
     },
     "eager_loading": {
         "type": "switch",
+        "name": "乐观加载",
         "default": false,
-        "hint": "乐观加载：收到图片消息即开始识图，可降低首图延迟。被丢弃的消息也会消耗 VLM 调用，默认关闭"
+        "hint": "乐观加载：收到图片消息即开始识图，可降低首图延迟。被丢弃的消息也会消耗 VLM 调用，默认关闭",
+        "locales": {
+            "zh": { "name": "乐观加载", "hint": "乐观加载：收到图片消息即开始识图，可降低首图延迟。被丢弃的消息也会消耗 VLM 调用，默认关闭" }
+        }
     }
 }
