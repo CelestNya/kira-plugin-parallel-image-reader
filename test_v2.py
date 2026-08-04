@@ -1735,6 +1735,39 @@ async def _t60():
     _check(vlm.call_count == 1, f"VLM called {vlm.call_count}, expected 1")
 
 
+@_test("T61: VLM 返回污染描述 → 降级不写缓存")
+async def _t61():
+    db = FakeDB()
+    md5 = "t61_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+
+    # 含 \x00 的污染描述（混沌测试发现：旧实现会写缓存）
+    vlm1 = FakeVLM("污染描述\x00测试")
+    plug1, mod1 = await _make_plugin(db, vlm1, {"load_mode": "lazy"})
+    await plug1.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug1.on_im_batch_message(batch_ev)
+    _check(db._cache.get(md5) is None, f"cache polluted: {db._cache}")
+    _check("(description unavailable)" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+
+    # 含旧占位符的污染描述
+    db2 = FakeDB()
+    vlm2 = FakeVLM("<!--PIR:deadbeef-->")
+    plug2, mod2 = await _make_plugin(db2, vlm2, {"load_mode": "lazy"})
+    ev2 = FakeMessageEvent([Image(md5=md5)])
+    await plug2.on_im_message(ev2)
+    batch_msg2 = _make_batch_from_event(ev2)
+    await plug2.on_im_batch_message(FakeMessageBatchEvent([batch_msg2]))
+    _check(db2._cache.get(md5) is None, f"cache polluted: {db2._cache}")
+    _check("<!--PIR" not in batch_msg2.message_str,
+           f"placeholder leaked: {batch_msg2.message_str!r}")
+    _check("(description unavailable)" in batch_msg2.message_str,
+           f"got: {batch_msg2.message_str!r}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -1763,6 +1796,8 @@ _TESTS = [
     _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56,
     # 多场景 / 换态矩阵（v2.3.0）
     _t57, _t58, _t59, _t60,
+    # 混沌测试发现的防御修复（v2.4.0）
+    _t61,
 ]
 
 

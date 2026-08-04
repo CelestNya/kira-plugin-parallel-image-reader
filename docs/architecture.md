@@ -342,6 +342,8 @@ graph LR
 | `hash_image()` 失败 | md5=None → 无缓存查询 → `noid_` 空标识符 → 降级 |
 | VLM 超时 | `wait_for` 60s → warning → `""` |
 | VLM 崩溃 / 未配置 | `_describe_one` 捕获 → warning → `""` |
+| VLM 返回空 / None | `if not (desc and _is_valid_desc(desc))` → `""`（不写缓存） |
+| VLM 返回污染描述（`\x00` / 旧占位符） | `_is_valid_desc` 写缓存前消毒 → 降级 `(description unavailable)`，缓存不被污染 |
 | `to_data_url()` 失败（quality 模式） | 同上 |
 | `_pir_images` 丢失 / 被破坏 | 空标识符残留（合法状态），不崩溃 |
 | 乐观 task 抛异常 | `gather(return_exceptions=True)` → 降级 |
@@ -393,12 +395,15 @@ graph LR
 
 ### 覆盖范围
 
-60 个单元测试（`_t1`–`_t60`），`python test_v2.py` 直跑：
+61 个单元测试（`_t1`–`_t61`），`python test_v2.py` 直跑：
 - lazy 阶段1/阶段2（T1-T24）、空标识符填充/残留语义（T25-T27）、discard 零 VLM（T28-T29）、hint（T30）、缓存不污染（T31-T32）、边界条件（T33-T40）
 - eager 乐观加载（T41-T46）
 - llm_select（T47-T56）：空标识符、阶段2 零 VLM、describe_image 三态（当前/历史/过期）、扫描替换、换态工具增删、旧配置迁移、id_map FIFO
 - 换态矩阵（T57-T60）：llm_select 多图逐张加载、缓存命中不进暂存、运行时换态全流程、历史标识符扫描 VLM 填充
+- 防御修复（T61）：VLM 返回污染描述（`\x00` / 旧占位符）→ 降级不写缓存
 
 集成测试（`tests/integration_harness.py`，真实核心管线）：三模式全链路 + 换态矩阵 + 压测（30 图并发零重复 VLM、缓存命中零新 VLM）。
 
-运行方式：`python test_v2.py`（单元），`KiraAI-src/.venv/Scripts/python.exe tests/integration_harness.py`（集成），退出码 0 = 全通过。
+混沌测试（`tests/chaos_test.py`，随机种子驱动）：故障注入（VLM 异常/超时/空/None/污染、hash 失败、DB 异常、链成环、eager task 取消、状态破坏、换态风暴、工具乱参）下验证不变量——事件钩子不抛异常、无死锁（5s 守卫）、无占位符泄漏、缓存纯净、VLM 计数不爆炸、task 清理。默认 4 种子 × 25 轮，`--seed N --rounds N` 可复现。
+
+运行方式：`python test_v2.py`（单元），`python tests/chaos_test.py`（混沌），`KiraAI-src/.venv/Scripts/python.exe tests/integration_harness.py`（集成），退出码 0 = 全通过。

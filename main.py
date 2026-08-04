@@ -638,17 +638,19 @@ class ParallelImageReader(BasePlugin):
                     desc_preview = desc[:80].replace(chr(10), " ") if desc else "(empty)"
                     vlm_logger.debug(
                         f"[VLM] #{idx + 1}/{total} done [{session_key}] | "
-                        f"len={len(desc)} | {desc_preview}..."
+                        f"len={len(desc or '')} | {desc_preview}..."
                     )
 
-            if desc:
-                try:
-                    await db.add_image_desc_cache(md5, desc, count=1, last_seen=0)
-                except Exception as e:
-                    logger.debug(
-                        f"[ParallelImageReader] failed to cache desc "
-                        f"[{session_key}] md5={md5[:8]}: {e}"
-                    )
+            if not (desc and _is_valid_desc(desc)):
+                # VLM 返回空 / 污染（\x00、旧占位符）：统一降级，且不写缓存
+                return ""
+            try:
+                await db.add_image_desc_cache(md5, desc, count=1, last_seen=0)
+            except Exception as e:
+                logger.debug(
+                    f"[ParallelImageReader] failed to cache desc "
+                    f"[{session_key}] md5={md5[:8]}: {e}"
+                )
             return desc
         except asyncio.TimeoutError:
             logger.warning(
