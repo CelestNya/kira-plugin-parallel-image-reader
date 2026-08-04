@@ -343,7 +343,8 @@ graph LR
 | VLM 超时 | `wait_for` 60s → warning → `""` |
 | VLM 崩溃 / 未配置 | `_describe_one` 捕获 → warning → `""` |
 | VLM 返回空 / None | `if not (desc and _is_valid_desc(desc))` → `""`（不写缓存） |
-| VLM 返回污染描述（`\x00` / 旧占位符） | `_is_valid_desc` 写缓存前消毒 → 降级 `(description unavailable)`，缓存不被污染 |
+| VLM 返回污染描述（`\x00` / 旧占位符 / 标识符格式） | `_is_valid_desc` 写缓存前消毒 → 降级 `(description unavailable)`，缓存不被污染 |
+| 标识符注入（VLM/用户/LLM 模仿 `[Image #id: ...]`） | 有内容跳过；空内容 → id_map 反查 → 不可追溯 → `已过期`；描述含 `[Image #` 一律拒绝（防嵌套污染） |
 | `to_data_url()` 失败（quality 模式） | 同上 |
 | `_pir_images` 丢失 / 被破坏 | 空标识符残留（合法状态），不崩溃 |
 | 乐观 task 抛异常 | `gather(return_exceptions=True)` → 降级 |
@@ -395,12 +396,12 @@ graph LR
 
 ### 覆盖范围
 
-61 个单元测试（`_t1`–`_t61`），`python test_v2.py` 直跑：
+62 个单元测试（`_t1`–`_t62`），`python test_v2.py` 直跑：
 - lazy 阶段1/阶段2（T1-T24）、空标识符填充/残留语义（T25-T27）、discard 零 VLM（T28-T29）、hint（T30）、缓存不污染（T31-T32）、边界条件（T33-T40）
 - eager 乐观加载（T41-T46）
 - llm_select（T47-T56）：空标识符、阶段2 零 VLM、describe_image 三态（当前/历史/过期）、扫描替换、换态工具增删、旧配置迁移、id_map FIFO
 - 换态矩阵（T57-T60）：llm_select 多图逐张加载、缓存命中不进暂存、运行时换态全流程、历史标识符扫描 VLM 填充
-- 防御修复（T61）：VLM 返回污染描述（`\x00` / 旧占位符）→ 降级不写缓存
+- 防御修复（T61-T62）：VLM 返回污染描述（`\x00` / 旧占位符 / 嵌套标识符）→ 降级不写缓存
 
 集成测试（`tests/integration_harness.py`，真实核心管线）：三模式全链路 + 换态矩阵 + 压测（30 图并发零重复 VLM、缓存命中零新 VLM）。
 

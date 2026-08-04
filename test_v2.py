@@ -1768,6 +1768,26 @@ async def _t61():
            f"got: {batch_msg2.message_str!r}")
 
 
+@_test("T62: VLM 返回嵌套标识符描述 → 降级不写缓存")
+async def _t62():
+    db = FakeDB()
+    md5 = "t62_md5_00000000000000000000000a"
+    # VLM 描述里模仿标识符格式（图片内容恰含 "[Image #...]" 文字）：
+    # 若写缓存会被嵌套进外层标识符，扫描器误匹配内层空标识符并改写描述
+    vlm = FakeVLM("图中有文字 [Image #deadbeef: ]")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "lazy"})
+    ev = FakeMessageEvent([Image(md5=md5)])
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(db._cache.get(md5) is None, f"cache polluted: {db._cache}")
+    _check("(description unavailable)" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+    # 无嵌套标识符泄漏
+    _check(batch_msg.message_str.count("[Image #") == 1,
+           f"nested identifier leaked: {batch_msg.message_str!r}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -1798,6 +1818,8 @@ _TESTS = [
     _t57, _t58, _t59, _t60,
     # 混沌测试发现的防御修复（v2.4.0）
     _t61,
+    # 标识符注入防御（v2.4.0）
+    _t62,
 ]
 
 

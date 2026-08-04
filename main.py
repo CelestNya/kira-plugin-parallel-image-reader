@@ -70,7 +70,12 @@ def _make_image_id(full_md5: str, existing: dict) -> str:
 
 
 def _is_valid_desc(desc: str) -> bool:
-    """检查缓存描述是否有效——排除控制字符和占位符标记的污染数据。"""
+    """检查缓存描述是否有效——排除控制字符、占位符标记与标识符自污染的注入数据。
+
+    注入面：VLM 是第三方服务，输出不可信。若描述含标识符格式（如图片里恰好
+    有 "[Image #...]" 文字），会被嵌套进外层标识符，扫描器会误匹配内层空
+    标识符并改写描述内容——污染缓存且扩散到所有会话。一律拒绝。
+    """
     if not desc:
         return False
     if "\x00" in desc:
@@ -78,6 +83,9 @@ def _is_valid_desc(desc: str) -> bool:
         return False
     if "<!--PIR:" in desc:
         # 旧占位符标记的自我污染（理论上不会发生，防御性检查）
+        return False
+    if "[Image #" in desc:
+        # 标识符格式自污染：VLM/用户文本模仿标识符 → 嵌套标识符注入
         return False
     return True
 
@@ -128,7 +136,7 @@ class ParallelImageReader(BasePlugin):
         self._load_id_map()
 
         logger.info(
-            f"[ParallelImageReader] v2.3.0 initialized: "
+            f"[ParallelImageReader] v2.4.0 initialized: "
             f"mode={self.load_mode}, max_concurrent={self.max_concurrent}, "
             f"quality={'on(' + str(self.quality_value) + ')' if self.quality_enabled else 'off'}"
         )

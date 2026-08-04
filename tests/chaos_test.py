@@ -52,6 +52,7 @@ _VLM_FAULTS = (
     + ["none"]          # 返回 None
     + ["pollute_nul"]   # 含 \x00 的污染描述
     + ["pollute_pir"]   # 含旧占位符的污染描述
+    + ["pollute_img"]   # 含标识符格式的嵌套污染（注入面）
 )
 
 
@@ -80,6 +81,8 @@ class ChaosVLM(tv.FakeVLM):
             return tv.FakeVLMResponse(f"污染描述\x00#{self.call_count}")
         if mode == "pollute_pir":
             return tv.FakeVLMResponse(f"<!--PIR:deadbeef-->#{self.call_count}")
+        if mode == "pollute_img":
+            return tv.FakeVLMResponse(f"图中有文字 [Image #deadbeef: ]#{self.call_count}")
         return tv.FakeVLMResponse(f"混沌描述 #{self.call_count}")
 
 
@@ -382,7 +385,8 @@ async def chaos_round(rng, rnd):
                 fails.append(f"round{rnd}: {llm_mode} 下 describe_image 未移除")
 
     # ── describe_image 工具混沌 ──
-    if rng.random() < 0.5:
+    # （纯净轮跳过：工具调用会对 _pir_images 中的图触发 VLM，干扰精确计数）
+    if not pure and rng.random() < 0.5:
         arg = rng.choice([
             _MD5_POOL[0][:8],          # 合法 id（可能在 id_map / _pir_images）
             "deadbeef",                # 不存在的 id
