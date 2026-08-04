@@ -50,15 +50,7 @@ JPEG 压缩质量，仅在 `quality_enabled` 开启时生效。
 - **85**: 画质与文件大小的良好平衡
 - **50**: 文件小，有明显压缩痕迹
 
----
-
-以下为折叠分组配置，展开对应模式的分组进行配置。
-
-## llm_select_config（LLM 选择性加载）
-
-该分组仅在 `load_mode=llm_select` 时生效。
-
-### id_map_limit
+## id_map_limit
 
 - **类型**: `integer`
 - **默认**: `1000`

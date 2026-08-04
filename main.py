@@ -130,9 +130,11 @@ class ParallelImageReader(BasePlugin):
                 mode = "lazy"
         self.load_mode = mode
 
-        # llm_select 专属配置（schema 的 llm_select_config section 内）
+        # id_map 上限（顶层配置；兼容旧版 llm_select_config section 内位置）
         llm_cfg = self.plugin_cfg.get("llm_select_config") or {}
-        self.id_map_limit = int(llm_cfg.get("id_map_limit", 1000))
+        self.id_map_limit = int(
+            self.plugin_cfg.get("id_map_limit") or llm_cfg.get("id_map_limit", 1000)
+        )
 
         self._sem = asyncio.Semaphore(self.max_concurrent)
         self._load_id_map()

@@ -39,47 +39,16 @@
             "zh": { "name": "压缩质量", "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效" }
         }
     },
-    "lazy_config": {
-        "type": "section",
-        "name": "懒加载",
-        "collapsed": true,
-        "hint": "懒加载模式（load_mode=lazy）的配置",
-        "fields": {},
+    "id_map_limit": {
+        "type": "integer",
+        "name": "标识符映射上限",
+        "default": 1000,
+        "hint": "short_id→完整md5 映射表最大条数，超限按写入顺序淘汰最早条目（FIFO）；用于换态后历史标识符反查缓存",
         "locales": {
-            "zh": { "name": "懒加载", "hint": "懒加载模式（load_mode=lazy）的配置" }
-        }
-    },
-    "eager_config": {
-        "type": "section",
-        "name": "乐观加载",
-        "collapsed": true,
-        "hint": "乐观加载模式（load_mode=eager）的配置",
-        "fields": {},
-        "locales": {
-            "zh": { "name": "乐观加载", "hint": "乐观加载模式（load_mode=eager）的配置" }
-        }
-    },
-    "llm_select_config": {
-        "type": "section",
-        "name": "LLM 选择性加载",
-        "collapsed": true,
-        "hint": "LLM 选择性加载模式（load_mode=llm_select）的配置",
-        "fields": {
-            "id_map_limit": {
-                "type": "integer",
+            "zh": {
                 "name": "标识符映射上限",
-                "default": 1000,
-                "hint": "short_id→完整md5 映射表最大条数，超限按写入顺序淘汰最早条目（FIFO）",
-                "locales": {
-                    "zh": {
-                        "name": "标识符映射上限",
-                        "hint": "short_id→完整md5 映射表最大条数，超限按写入顺序淘汰最早条目（FIFO）"
-                    }
-                }
+                "hint": "short_id→完整md5 映射表最大条数，超限按写入顺序淘汰最早条目（FIFO）；用于换态后历史标识符反查缓存"
             }
-        },
-        "locales": {
-            "zh": { "name": "LLM 选择性加载", "hint": "LLM 选择性加载模式（load_mode=llm_select）的配置" }
         }
     }
 }

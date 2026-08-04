@@ -40,7 +40,7 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 | `max_concurrent` | 整数 | 3 | 同时识别的图片数，越大越快但消耗越高 |
 | `quality_enabled` | 开关 | 关 | 压缩后送识图，减少上传体积 |
 | `quality_value` | 整数 | 85 | 压缩质量 (10-100)，开启压缩时生效 |
-| `llm_select_config.id_map_limit` | 整数 | 1000 | 标识符映射表上限（llm_select 模式） |
+| `id_map_limit` | 整数 | 1000 | 标识符映射表上限（超限 FIFO 淘汰） |
 
 ## 版本记录
 

@@ -366,12 +366,10 @@ graph LR
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `load_mode` | enum | lazy | lazy / eager / llm_select 三态互斥 |
-| `max_concurrent` | integer | 3 | 最大并发 VLM 调用数（顶层通用） |
+| `max_concurrent` | integer | 3 | 最大并发 VLM 调用数（三模式通用） |
 | `quality_enabled` | switch | false | JPEG 压缩后再送 VLM |
 | `quality_value` | integer | 85 | JPEG 压缩质量 (10-100) |
-| `lazy_config` | section | - | 懒加载专属配置（折叠） |
-| `eager_config` | section | - | 乐观加载专属配置（折叠） |
-| `llm_select_config.id_map_limit` | integer | 1000 | id_map 上限（折叠 section 内） |
+| `id_map_limit` | integer | 1000 | id_map 上限（兼容旧 `llm_select_config` section 内位置，顶层优先） |
 
 装配：`initialize()` 从 `plugin_cfg` 读取。旧配置兼容：`eager_loading=true` 且未设 `load_mode` → 迁移为 `eager`。
 

@@ -1600,6 +1600,25 @@ async def _t55():
     _check(plug3.load_mode == "llm_select",
            f"load_mode should prefer explicit: {plug3.load_mode}")
 
+    # 顶层 id_map_limit 读取（schema 简化：配置项都放外面）
+    plug4, mod4 = await _make_plugin(db, FakeVLM("desc"),
+                                     {"load_mode": "llm_select",
+                                      "id_map_limit": 42})
+    _check(plug4.id_map_limit == 42, f"id_map_limit: {plug4.id_map_limit}")
+
+    # 兼容旧位置：llm_select_config section 内的 id_map_limit
+    plug5, mod5 = await _make_plugin(db, FakeVLM("desc"),
+                                     {"load_mode": "llm_select",
+                                      "llm_select_config": {"id_map_limit": 7}})
+    _check(plug5.id_map_limit == 7, f"legacy id_map_limit: {plug5.id_map_limit}")
+
+    # 顶层优先于旧位置
+    plug6, mod6 = await _make_plugin(db, FakeVLM("desc"),
+                                     {"load_mode": "llm_select",
+                                      "id_map_limit": 42,
+                                      "llm_select_config": {"id_map_limit": 7}})
+    _check(plug6.id_map_limit == 42, f"top-level should win: {plug6.id_map_limit}")
+
 
 @_test("T56: id_map 1000 条 FIFO 淘汰")
 async def _t56():
