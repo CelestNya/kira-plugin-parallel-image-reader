@@ -1,4 +1,17 @@
 {
+    "load_mode": {
+        "type": "enum",
+        "name": "加载模式",
+        "options": ["lazy", "eager", "llm_select"],
+        "default": "lazy",
+        "hint": "图片描述加载方式：懒加载（触发时才识图，被忽略的消息零消耗）/ 乐观加载（收到即识图，延迟更低但消耗更多）/ LLM 选择性加载（LLM 按需调工具识图，最省 VLM）",
+        "locales": {
+            "zh": {
+                "name": "加载模式",
+                "hint": "图片描述加载方式：懒加载（触发时才识图，被忽略的消息零消耗）/ 乐观加载（收到即识图，延迟更低但消耗更多）/ LLM 选择性加载（LLM 按需调工具识图，最省 VLM）"
+            }
+        }
+    },
     "max_concurrent": {
         "type": "integer",
         "name": "最大并发数",
@@ -26,13 +39,47 @@
             "zh": { "name": "压缩质量", "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效" }
         }
     },
-    "eager_loading": {
-        "type": "switch",
-        "name": "乐观加载",
-        "default": false,
-        "hint": "乐观加载：收到图片消息即开始识图，可降低首图延迟。被丢弃的消息也会消耗 VLM 调用，默认关闭",
+    "lazy_config": {
+        "type": "section",
+        "name": "懒加载",
+        "collapsed": true,
+        "hint": "懒加载模式（load_mode=lazy）的配置",
+        "fields": {},
         "locales": {
-            "zh": { "name": "乐观加载", "hint": "乐观加载：收到图片消息即开始识图，可降低首图延迟。被丢弃的消息也会消耗 VLM 调用，默认关闭" }
+            "zh": { "name": "懒加载", "hint": "懒加载模式（load_mode=lazy）的配置" }
+        }
+    },
+    "eager_config": {
+        "type": "section",
+        "name": "乐观加载",
+        "collapsed": true,
+        "hint": "乐观加载模式（load_mode=eager）的配置",
+        "fields": {},
+        "locales": {
+            "zh": { "name": "乐观加载", "hint": "乐观加载模式（load_mode=eager）的配置" }
+        }
+    },
+    "llm_select_config": {
+        "type": "section",
+        "name": "LLM 选择性加载",
+        "collapsed": true,
+        "hint": "LLM 选择性加载模式（load_mode=llm_select）的配置",
+        "fields": {
+            "id_map_limit": {
+                "type": "integer",
+                "name": "标识符映射上限",
+                "default": 1000,
+                "hint": "short_id→完整md5 映射表最大条数，超限按写入顺序淘汰最早条目（FIFO）",
+                "locales": {
+                    "zh": {
+                        "name": "标识符映射上限",
+                        "hint": "short_id→完整md5 映射表最大条数，超限按写入顺序淘汰最早条目（FIFO）"
+                    }
+                }
+            }
+        },
+        "locales": {
+            "zh": { "name": "LLM 选择性加载", "hint": "LLM 选择性加载模式（load_mode=llm_select）的配置" }
         }
     }
 }

@@ -18,7 +18,7 @@ export default defineConfig({
         text: '指南',
         items: [
           { text: '安装', link: '/guide/install' },
-          { text: '工作流程', link: '/guide/workflow' },
+          { text: '架构设计', link: '/architecture' },
         ],
       },
       {

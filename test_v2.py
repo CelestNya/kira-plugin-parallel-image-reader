@@ -82,10 +82,21 @@ class Forward:
 
 
 class LLMRequest:
-    def __init__(self, messages=None, system_prompt=None, user_prompt=None):
+    def __init__(self, messages=None, system_prompt=None, user_prompt=None,
+                 tool_set=None):
         self.messages = messages or []
         self.system_prompt = system_prompt or []
         self.user_prompt = user_prompt or []
+        self.tool_set = tool_set
+
+
+class FakeToolSet:
+    """模拟 ToolSet — 支持 remove 检查。"""
+    def __init__(self, names: list[str] = None):
+        self.tools = names or []
+
+    def remove(self, *names):
+        self.tools = [t for t in self.tools if t not in names]
 
 
 # ── Fake DB with in-memory cache ──
@@ -143,7 +154,7 @@ class FakeCtx:
     def __init__(self, db: FakeDB, vlm: FakeVLM):
         self.db = db
         self._vlm = vlm
-        self._data_dir = str(Path(__file__).parent / "_test_data")
+        self._data_dir = Path(__file__).parent / "_test_data"
 
     def get_plugin_data_dir(self):
         return self._data_dir
@@ -164,8 +175,9 @@ class FakeMessage:
     """模拟 KiraIMMessage — 有 chain 和 message_str，可挂自定义属性。"""
     def __init__(self, chain, message_str=None):
         self.chain = FakeMessageChain(chain)
-        # _pir_pending 默认 None（模拟本体行为，插件会设置它）
-        self._pir_pending = None
+        # _pir_images / _pir_optimistic 默认 None（模拟本体行为，插件会设置它）
+        self._pir_images = None
+        self._pir_optimistic = None
         # message_str 模拟本体 message_format_to_text 的输出
         if message_str is not None:
             self.message_str = message_str
@@ -234,12 +246,12 @@ class FakeMessageEvent:
 
 
 class FakeBatchMessage:
-    """模拟 batch 中的单条消息。chain 是已经过阶段1处理的（Image→Text占位）。"""
-    def __init__(self, chain, message_str=None, _pir_pending=None,
-                 _pir_optimistic=None):
+    """模拟 batch 中的单条消息。chain 是已经过阶段1处理的（Image→Text空标识符）。"""
+    def __init__(self, chain, message_str=None,
+                 _pir_optimistic=None, _pir_images=None):
         self.chain = FakeMessageChain(chain)
-        self._pir_pending = _pir_pending
         self._pir_optimistic = _pir_optimistic
+        self._pir_images = _pir_images
         self.message_str = message_str if message_str is not None else _simulate_format_to_text(chain)
 
 
@@ -288,11 +300,18 @@ def load_plugin():
             def deco(f): return f
             return deco
 
+    class _register:
+        """register.tool(...) 装饰器 stub。"""
+        @staticmethod
+        def tool(name, description, params):
+            def deco(f): return f
+            return deco
+
     # Register core stubs BEFORE import
     _stub("core.logging_manager", get_logger=lambda *a, **k: _Logger())
     _stub("core.plugin", BasePlugin=_BasePlugin, PluginContext=object,
-          register_tool=lambda *a, **k: (lambda f: f), on=_on, Priority=_Priority,
-          logger=_Logger())
+          register_tool=lambda *a, **k: (lambda f: f), register=_register,
+          on=_on, Priority=_Priority, logger=_Logger())
     _stub("core.chat.message_elements", Image=Image, Text=Text, Sticker=Sticker,
           Reply=Reply, Forward=Forward)
     _stub("core.chat.message_utils", KiraMessageEvent=FakeMessageEvent,
@@ -305,6 +324,19 @@ def load_plugin():
 
     _stub("core.utils.common_utils", desc_img=_fake_desc_img)
     _stub("core.provider", LLMRequest=LLMRequest)
+
+    class _Prompt:
+        """Prompt stub — 与 core.prompt_manager.Prompt 接口对齐。"""
+        def __init__(self, content, name=None, source=None, persist=True):
+            self.content = content
+            self.name = name
+            self.source = source
+            self.persist = persist
+
+        def to_string(self):
+            return self.content or ""
+
+    _stub("core.prompt_manager", Prompt=_Prompt)
 
     # Stub PIL — realistic enough for the quality path (convert, resize, save)
     class _FakePIL:
@@ -342,18 +374,28 @@ async def _make_plugin(db: FakeDB, vlm: FakeVLM, cfg: Optional[dict] = None):
     return plug, mod
 
 
+def _make_plugin_ctx(db: FakeDB, vlm: FakeVLM, data_dir: str):
+    """Create a plugin with an isolated data dir (id_map 测试用)。"""
+    mod, _ = load_plugin()
+    ctx = FakeCtx(db, vlm)
+    ctx._data_dir = data_dir
+    plug = mod.ParallelImageReader(ctx, {})
+    return plug, ctx
+
+
 def _chain_texts(chain) -> list[str]:
     """Extract content from Text elements in a chain (flat, no recursion)."""
     return [ele.text if hasattr(ele, "text") else str(ele) for ele in chain]
 
 
 import re as _re
-_PH_RE = _re.compile(r"<!--PIR:[^>]*-->")
+# 空标识符：[Image #id: ]（待填充态）
+_EMPTY_ID_RE = _re.compile(r"\[Image #[^\]]+: \]")
 
 
 def _is_placeholder(text: str) -> bool:
-    """判断文本是否为占位符。"""
-    return bool(_PH_RE.match(text))
+    """判断文本是否为空标识符（待填充态）。"""
+    return bool(_EMPTY_ID_RE.match(text))
 
 
 def _make_batch_from_event(ev: FakeMessageEvent) -> FakeBatchMessage:
@@ -361,15 +403,15 @@ def _make_batch_from_event(ev: FakeMessageEvent) -> FakeBatchMessage:
 
     模拟本体 flush_session_messages 的行为：batch 里的 message 就是
     ON_IM_MESSAGE 阶段的 event.message（同一个实例）。
-    附带传递 _pir_pending 和 _pir_optimistic。
+    附带传递 _pir_images / _pir_optimistic。
     """
     msg = ev.message
-    # 重新生成 message_str（模拟本体 message_format_to_text，此时 chain 已含占位 Text）
+    # 重新生成 message_str（模拟本体 message_format_to_text，此时 chain 已含空标识符）
     msg.message_str = _simulate_format_to_text(msg.chain)
     return FakeBatchMessage(
         chain=msg.chain,
         message_str=msg.message_str,
-        _pir_pending=getattr(msg, "_pir_pending", None),
+        _pir_images=getattr(msg, "_pir_images", None),
         _pir_optimistic=getattr(msg, "_pir_optimistic", None),
     )
 
@@ -407,7 +449,7 @@ def _check(cond, msg=""):
 
 # ── 阶段 1: ON_IM_MESSAGE 占位替换测试 ──
 
-@_test("T1: on_im_message 缓存未命中 → 替换为占位符 + 暂存")
+@_test("T1: on_im_message 缓存未命中 → 替换为空标识符 + 暂存 _pir_images")
 async def _t1():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("一只猫"))
     img = Image(md5="t1_md5_0000000000000000000000ab")
@@ -415,12 +457,12 @@ async def _t1():
 
     await plug.on_im_message(ev)
 
-    # Image 应被替换为 Text(占位符)
+    # Image 应被替换为 Text(空标识符)
     _check(isinstance(ev.message.chain[0], Text), "Image should be replaced by Text")
     _check(_is_placeholder(ev.message.chain[0].text), f"not placeholder: {ev.message.chain[0].text!r}")
-    # 暂存到 _pir_pending
-    pending = getattr(ev.message, "_pir_pending", None)
-    _check(pending is not None and len(pending) == 1, f"pending={pending}")
+    # 暂存到 _pir_images
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is not None and len(images_map) == 1, f"images_map={images_map}")
     # VLM 不应被调用
     _check(plug.ctx.provider_mgr.get_default_vlm().call_count == 0, "VLM should not be called")
 
@@ -436,10 +478,10 @@ async def _t2():
     await plug.on_im_message(ev)
 
     _check(isinstance(ev.message.chain[0], Text), "should be Text")
-    _check("[Image: cached cat]" == ev.message.chain[0].text, f"got: {ev.message.chain[0].text}")
+    _check("[Image #t2_md5_0: cached cat]" == ev.message.chain[0].text, f"got: {ev.message.chain[0].text}")
     _check(plug.ctx.provider_mgr.get_default_vlm().call_count == 0)
-    # 不应有 pending
-    _check(getattr(ev.message, "_pir_pending", None) is None, "should not have pending")
+    # 缓存命中不应有 _pir_images
+    _check(getattr(ev.message, "_pir_images", None) is None, "should not have images_map")
 
 
 @_test("T3: on_im_message 混合缓存命中/未命中")
@@ -453,10 +495,10 @@ async def _t3():
 
     await plug.on_im_message(ev)
 
-    _check("[Image: cached]" == ev.message.chain[0].text, f"hit: {ev.message.chain[0].text}")
+    _check("[Image #hit_md5_: cached]" == ev.message.chain[0].text, f"hit: {ev.message.chain[0].text}")
     _check(_is_placeholder(ev.message.chain[1].text), f"miss: {ev.message.chain[1].text}")
-    pending = getattr(ev.message, "_pir_pending", None)
-    _check(pending is not None and len(pending) == 1, f"pending={pending}")
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is not None and len(images_map) == 1, f"images_map={images_map}")
 
 
 @_test("T4: on_im_message 无图片 → 无操作")
@@ -466,7 +508,7 @@ async def _t4():
     await plug.on_im_message(ev)
     _check(isinstance(ev.message.chain[0], Text))
     _check(isinstance(ev.message.chain[1], Text))
-    _check(getattr(ev.message, "_pir_pending", None) is None)
+    _check(getattr(ev.message, "_pir_images", None) is None)
 
 
 @_test("T5: on_im_message 嵌套 Reply 中的图片被替换")
@@ -534,10 +576,10 @@ async def _t9():
     await plug.on_im_batch_message(batch_ev)
 
     # message_str 中的占位符应被替换
-    _check("[Image: 一只猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
+    _check("[Image #t9_md5_0: 一只猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
     _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
     # chain 中的占位 Text 也应被替换
-    _check("[Image: 一只猫]" == batch_msg.chain[0].text, f"chain[0]: {batch_msg.chain[0].text}")
+    _check("[Image #t9_md5_0: 一只猫]" == batch_msg.chain[0].text, f"chain[0]: {batch_msg.chain[0].text}")
 
 
 @_test("T10: batch 多图并行（3图50ms各 → ~50ms）")
@@ -554,9 +596,9 @@ async def _t10():
     await plug.on_im_batch_message(batch_ev)
     elapsed = time.monotonic() - t0
 
-    # 3 个占位符都应被替换
+    # 3 个占位符都应被替换为 [Image #id: desc]（id 各不相同）
     _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
-    count = batch_msg.message_str.count("[Image: desc]")
+    count = batch_msg.message_str.count(": desc]")
     _check(count == 3, f"expected 3, got {count}")
     _check(elapsed < 0.12, f"took {elapsed:.3f}s, expected < 0.12s (parallel)")
 
@@ -576,7 +618,7 @@ async def _t11():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    _check("[Image: cached description]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image #t11_md5_: cached description]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
     _check(vlm.call_count == 0, f"VLM called {vlm.call_count} times (expected 0)")
 
 
@@ -615,8 +657,9 @@ async def _t13():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    _check("[Image: cached]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
-    _check("[Image: fresh]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("cached" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("fresh" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check(": ]" not in batch_msg.message_str, f"empty id left: {batch_msg.message_str}")
     _check(vlm.call_count == 1, f"VLM called {vlm.call_count} times (expected 1)")
 
 
@@ -666,7 +709,7 @@ async def _t16():
     elapsed = time.monotonic() - t0
 
     _check(elapsed >= 0.07, f"too fast ({elapsed:.3f}s), expected >= 90ms (sequential)")
-    count = batch_msg.message_str.count("[Image: slow]")
+    count = batch_msg.message_str.count(": slow]")
     _check(count == 3, f"expected 3, got {count}")
 
 
@@ -682,7 +725,7 @@ async def _t17():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    _check("[Image: quality desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image #t17_md5_: quality desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
 @_test("T18: batch Sticker 元素 → 描述")
@@ -696,7 +739,7 @@ async def _t18():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    _check("[Image: sticker desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image #t18_md5_: sticker desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
 @_test("T19: batch 空 chain → 无错误")
@@ -720,10 +763,10 @@ async def _t20():
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    # Reply.chain[1] 应从 Text(占位符) 变为 Text("[Image: 猫]")
-    _check("[Image: 猫]" == batch_msg.chain[1].chain[1].text,
+    # Reply.chain[1] 应从 Text(占位符) 变为 Text("[Image #reply_md: 猫]")
+    _check("[Image #reply_md: 猫]" == batch_msg.chain[1].chain[1].text,
            f"got: {batch_msg.chain[1].chain[1].text}")
-    _check("[Image: 猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
+    _check("[Image #reply_md: 猫]" in batch_msg.message_str, f"message_str: {batch_msg.message_str}")
 
 
 @_test("T21: batch 嵌套 Forward 中的图片 → 描述+替换")
@@ -740,9 +783,9 @@ async def _t21():
     await plug.on_im_batch_message(batch_ev)
 
     fwd = batch_msg.chain[0]
-    _check("[Image: 图]" == fwd.chains[0][0].text, f"c0[0]: {fwd.chains[0][0].text}")
-    _check("[Image: 图]" == fwd.chains[1][1].text, f"c1[1]: {fwd.chains[1][1].text}")
-    _check(batch_msg.message_str.count("[Image: 图]") == 2, f"message_str: {batch_msg.message_str}")
+    _check("[Image #f1_md5_0: 图]" == fwd.chains[0][0].text, f"c0[0]: {fwd.chains[0][0].text}")
+    _check("[Image #f2_md5_0: 图]" == fwd.chains[1][1].text, f"c1[1]: {fwd.chains[1][1].text}")
+    _check(batch_msg.message_str.count(": 图]") == 2, f"message_str: {batch_msg.message_str}")
 
 
 @_test("T22: batch Sticker 嵌套 Forward → 描述+替换")
@@ -758,7 +801,7 @@ async def _t22():
     await plug.on_im_batch_message(batch_ev)
 
     c0 = batch_msg.chain[0].chains[0]
-    _check("[Image: 图]" == c0[0].text, f"got: {c0[0].text}")
+    _check("[Image #s1_md5_0: 图]" == c0[0].text, f"got: {c0[0].text}")
 
 
 @_test("T23: batch 环检测不崩溃")
@@ -802,7 +845,7 @@ async def _t25():
     await plug.on_im_batch_message(batch_ev)
 
     _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
-    _check("[Image: 猫]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image #t25_md5_: 猫]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
 @_test("T26: 占位符不泄漏到 message_str（缓存命中）")
@@ -820,10 +863,10 @@ async def _t26():
     await plug.on_im_batch_message(batch_ev)
 
     _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
-    _check("[Image: cached desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image #t26_md5_: cached desc]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
-@_test("T27: 占位符不泄漏到 message_str（异常兜底）")
+@_test("T27: 异常路径 → 空标识符残留合法，不崩溃")
 async def _t27():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
     img = Image(md5="t27_md5_00000000000000000000000a")
@@ -831,8 +874,8 @@ async def _t27():
     await plug.on_im_message(ev)
 
     batch_msg = _make_batch_from_event(ev)
-    # 故意破坏 _pir_pending，触发异常路径
-    batch_msg._pir_pending = "broken"
+    # 故意破坏 _pir_images，触发异常路径（非 dict）
+    batch_msg._pir_images = "broken"
     batch_ev = FakeMessageBatchEvent([batch_msg])
 
     try:
@@ -840,6 +883,7 @@ async def _t27():
     except Exception:
         pass  # 异常应被捕获
 
+    # 空标识符残留是合法状态（与 llm_select 常态一致），无旧占位符
     _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
 
 
@@ -879,8 +923,8 @@ async def _t29():
 
     # 两图并行（concurrency=3），20ms 各 → ~20ms
     _check(elapsed < 0.06, f"took {elapsed:.3f}s, expected < 0.06s (parallel batch)")
-    _check("[Image: desc]" in batch_msg1.message_str, f"msg1: {batch_msg1.message_str}")
-    _check("[Image: desc]" in batch_msg2.message_str, f"msg2: {batch_msg2.message_str}")
+    _check("[Image #t29_1_md: desc]" in batch_msg1.message_str, f"msg1: {batch_msg1.message_str}")
+    _check("[Image #t29_2_md: desc]" in batch_msg2.message_str, f"msg2: {batch_msg2.message_str}")
 
 
 # ── on_llm_request system hint 测试 ──
@@ -894,7 +938,7 @@ async def _t30():
 
     await plug.on_llm_request(fake_batch_ev, req)
 
-    _check("当消息中包含 [Image: 描述内容]" in fake_prompt.content,
+    _check("当消息中包含 [Image #xxxx: 描述内容]" in fake_prompt.content,
            f"hint not injected: {fake_prompt.content}")
 
 
@@ -933,7 +977,7 @@ async def _t32():
     ev = FakeMessageEvent([img])
     await plug.on_im_message(ev)
 
-    # 污染缓存应被忽略，图片走 pending（占位符），不是 [Image: 污染数据]
+    # 污染缓存应被忽略，图片走 pending（占位符），不是 "[Image #t32_md5_: 污染数据]"
     _check(isinstance(ev.message.chain[0], Text), "should be Text")
     _check(_is_placeholder(ev.message.chain[0].text),
            f"polluted cache should be ignored, got: {ev.message.chain[0].text!r}")
@@ -945,7 +989,7 @@ async def _t32():
     # VLM 应被调用
     _check(vlm.call_count == 1, f"VLM should be called, got {vlm.call_count}")
     # 最终描述应是真实描述
-    _check("[Image: fresh real desc]" in batch_msg.message_str,
+    _check("[Image #t32_md5_: fresh real desc]" in batch_msg.message_str,
            f"got: {batch_msg.message_str}")
     # 缓存应被正确覆写
     cached = await db.get_image_desc_cache(md5)
@@ -967,26 +1011,26 @@ class _HashFailImage(Image):
         raise RuntimeError("image data corrupted")
 
 
-@_test("T33: hash_image 失败 → 阶段1降级占位，阶段2降级描述")
+@_test("T33: hash_image 失败 → 阶段1空标识符（noid_），阶段2降级描述")
 async def _t33():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
     img = _HashFailImage()
     ev = FakeMessageEvent([img, Text("hello")])
     await plug.on_im_message(ev)
 
-    # 阶段1应设占位符（用 noid_ 前缀），不崩溃
+    # 阶段1应设空标识符（用 noid_ 前缀），不崩溃
     _check(isinstance(ev.message.chain[0], Text), "should be Text placeholder")
     _check(_is_placeholder(ev.message.chain[0].text), f"not placeholder: {ev.message.chain[0].text!r}")
-    pending = getattr(ev.message, "_pir_pending", None)
-    _check(pending is not None and len(pending) == 1, "should have 1 pending")
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is not None and len(images_map) == 1, "should have 1 images_map")
 
-    # 阶段2：hash 再次失败，_one 的 try/except 捕获，返回空描述
+    # 阶段2：hash 再次失败，_describe_one 的 try/except 捕获，返回空描述
     batch_msg = _make_batch_from_event(ev)
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
 
-    # 占位符应被替换为降级文本
-    _check("<!--PIR" not in batch_msg.message_str, f"placeholder leaked: {batch_msg.message_str!r}")
+    # 空标识符应被替换为降级文本
+    _check(": ]" not in batch_msg.message_str, f"empty id leaked: {batch_msg.message_str!r}")
     _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
@@ -1104,26 +1148,26 @@ async def _t36():
     _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
 
 
-# ── T37: _pir_pending 丢失（message 实例未复用） ──
+# ── T37: _pir_images 丢失（message 实例未复用） ──
 
-@_test("T37: _pir_pending 丢失 → 占位符降级清理，不崩溃")
+@_test("T37: _pir_images 丢失 → 空标识符残留为合法状态，不崩溃")
 async def _t37():
     plug, mod = await _make_plugin(FakeDB(), FakeVLM("desc"))
     img = Image(md5="t37_md5_00000000000000000000000a")
     ev = FakeMessageEvent([img])
     await plug.on_im_message(ev)
 
-    # 构造一个没有 _pir_pending 的 batch_msg（模拟实例未复用）
-    chain = ev.message.chain  # chain 里有占位 Text
-    batch_msg = FakeBatchMessage(chain, message_str="<!--PIR:t37_md5_00000000000000000000000a-->")
-    batch_msg._pir_pending = None  # 模拟丢失
+    # 构造一个没有 _pir_images 的 batch_msg（模拟实例未复用 / 属性丢失）
+    chain = ev.message.chain  # chain 里有空标识符 Text
+    batch_msg = FakeBatchMessage(chain, message_str=f"[Image #t37_md5_: ]")
+    batch_msg._pir_images = None  # 模拟丢失
     batch_ev = FakeMessageBatchEvent([batch_msg])
 
     await plug.on_im_batch_message(batch_ev)
 
-    # 占位符应被清理为降级文本
+    # 空标识符残留是合法状态（与 llm_select 常态一致），不崩溃、无旧占位符
     _check("<!--PIR" not in batch_msg.message_str, f"leaked: {batch_msg.message_str!r}")
-    _check("(description unavailable)" in batch_msg.message_str, f"got: {batch_msg.message_str}")
+    _check("[Image #t37_md5_: ]" in batch_msg.message_str, f"got: {batch_msg.message_str}")
 
 
 # ── T38: 同一图片重复出现（同 md5，多消息） ──
@@ -1145,8 +1189,8 @@ async def _t38():
     await plug.on_im_batch_message(batch_ev)
 
     # 两条消息的占位符都应被替换
-    _check("[Image: same desc]" in batch_msg1.message_str, f"msg1: {batch_msg1.message_str}")
-    _check("[Image: same desc]" in batch_msg2.message_str, f"msg2: {batch_msg2.message_str}")
+    _check("[Image #t38_md5_: same desc]" in batch_msg1.message_str, f"msg1: {batch_msg1.message_str}")
+    _check("[Image #t38_md5_: same desc]" in batch_msg2.message_str, f"msg2: {batch_msg2.message_str}")
     _check("<!--PIR" not in batch_msg1.message_str, "msg1 leaked")
     _check("<!--PIR" not in batch_msg2.message_str, "msg2 leaked")
 
@@ -1166,7 +1210,7 @@ async def _t39():
     await plug.on_im_batch_message(batch_ev)
 
     # chain 中的占位符应被替换
-    _check("[Image: desc]" == batch_msg.chain[0].text, f"chain: {batch_msg.chain[0].text}")
+    _check("[Image #t39_md5_: desc]" == batch_msg.chain[0].text, f"chain: {batch_msg.chain[0].text}")
 
 
 # ── T40: 混合场景（hash成功+失败+缓存命中+VLM失败） ──
@@ -1193,7 +1237,7 @@ async def _t40():
     await plug.on_im_batch_message(batch_ev)
 
     # 缓存命中的有描述
-    _check("[Image: cached desc]" in batch_msg.message_str, f"cached: {batch_msg.message_str}")
+    _check("[Image #cached_m: cached desc]" in batch_msg.message_str, f"cached: {batch_msg.message_str}")
     # 其余降级
     _check(batch_msg.message_str.count("(description unavailable)") == 3,
            f"expected 3 unavailable, got: {batch_msg.message_str}")
@@ -1219,8 +1263,8 @@ async def _t41():
     elapsed = time.monotonic() - t0
     _check(elapsed < 0.05,
            f"on_im_message blocked {elapsed:.3f}s (VLM delay=0.1s)")
-    pending = getattr(ev.message, "_pir_pending", None)
-    _check(pending is not None and len(pending) == 1, "should have 1 pending")
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is not None and len(images_map) == 1, "should have 1 images_map")
     task = getattr(ev.message, "_pir_optimistic", None)
     _check(task is not None, "should have optimistic task")
     await asyncio.sleep(0.15)  # 等待 task 完成
@@ -1243,7 +1287,7 @@ async def _t42():
 
     _check(vlm.call_count == 1,
            f"VLM called {vlm.call_count}, expected 1 (reuse)")
-    _check("[Image: eager_desc]" in batch_msg.message_str,
+    _check("[Image #t42_md5_: eager_desc]" in batch_msg.message_str,
            f"got: {batch_msg.message_str}")
     _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
     cached = await db.get_image_desc_cache(md5)
@@ -1261,9 +1305,9 @@ async def _t43():
     ev = FakeMessageEvent([img])
     await plug.on_im_message(ev)
 
-    pending = getattr(ev.message, "_pir_pending", None)
-    _check(pending is None or len(pending) == 0,
-           "should have no pending (cache hit)")
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is None or len(images_map) == 0,
+           "should have no images_map (cache hit)")
     task = getattr(ev.message, "_pir_optimistic", None)
     _check(task is None, "should have no optimistic task (cache hit)")
     _check(vlm.call_count == 0,
@@ -1308,15 +1352,15 @@ async def _t45():
     ev = FakeMessageEvent([img])
     await plug.on_im_message(ev)
 
-    pending = getattr(ev.message, "_pir_pending", None)
-    _check(pending is not None, "should have pending")
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is not None, "should have images_map")
     task = getattr(ev.message, "_pir_optimistic", None)
     _check(task is None, "should NOT have optimistic task when eager=off")
 
     batch_msg = _make_batch_from_event(ev)
     batch_ev = FakeMessageBatchEvent([batch_msg])
     await plug.on_im_batch_message(batch_ev)
-    _check("[Image: desc]" in batch_msg.message_str,
+    _check("[Image #t45_md5_: desc]" in batch_msg.message_str,
            f"got: {batch_msg.message_str}")
     _check(vlm.call_count == 1,
            f"VLM called {vlm.call_count}, expected 1 (fresh)")
@@ -1345,12 +1389,350 @@ async def _t46():
     # VLM 仅被每条消息的 on_im_message 各调一次
     _check(vlm.call_count == 2,
            f"VLM called {vlm.call_count}, expected 2")
-    _check("[Image: desc46]" in batch_msg1.message_str,
+    _check(f"[Image #{md5_1[:8]}: desc46]" in batch_msg1.message_str,
            f"msg1: {batch_msg1.message_str}")
-    _check("[Image: desc46]" in batch_msg2.message_str,
+    _check(f"[Image #{md5_2[:8]}: desc46]" in batch_msg2.message_str,
            f"msg2: {batch_msg2.message_str}")
     _check("<!--PIR" not in batch_msg1.message_str, "msg1 placeholder leaked")
     _check("<!--PIR" not in batch_msg2.message_str, "msg2 placeholder leaked")
+
+
+# ═══════════════════════════════════════════════════════════════
+# llm_select 模式测试（v2.3.0）
+# ═══════════════════════════════════════════════════════════════
+
+def _mk_tool_req(messages=None, system_prompt=None):
+    """构造带 FakeToolSet 的 LLMRequest。"""
+    tool_set = FakeToolSet(["describe_image"])
+    return LLMRequest(messages=messages or [], system_prompt=system_prompt or [],
+                      tool_set=tool_set), tool_set
+
+
+@_test("T47: llm_select 阶段1 → 空标识符 + _pir_images + id_map")
+async def _t47():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t47_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    # 空标识符 [Image #id: ]，不触发 VLM
+    _check(f"[Image #{md5[:8]}: ]" == ev.message.chain[0].text,
+           f"got: {ev.message.chain[0].text!r}")
+    _check(vlm.call_count == 0, f"VLM called {vlm.call_count}, expected 0")
+    # _pir_images 挂原图
+    images_map = getattr(ev.message, "_pir_images", None)
+    _check(images_map is not None and md5[:8] in images_map,
+           f"no _pir_images: {images_map}")
+    # id_map 写入
+    _check(plug._id_map.get(md5[:8]) == md5, f"id_map: {plug._id_map}")
+
+
+@_test("T48: llm_select 阶段2 不 VLM，空标识符进历史")
+async def _t48():
+    db = FakeDB()
+    vlm = FakeVLM("desc", delay=0.05)
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t48_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    t0 = time.monotonic()
+    await plug.on_im_batch_message(batch_ev)
+    elapsed = time.monotonic() - t0
+
+    # 零 VLM、零等待
+    _check(vlm.call_count == 0, f"VLM called {vlm.call_count}, expected 0")
+    _check(elapsed < 0.02, f"batch took {elapsed:.3f}s, expected ~0")
+    # 空标识符进历史（message_str 保持 [Image #id: ]）
+    _check(f"[Image #{md5[:8]}: ]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str}")
+    _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
+
+
+@_test("T49: describe_image 当前回合 → VLM 描述")
+async def _t49():
+    db = FakeDB()
+    vlm = FakeVLM("tool desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t49_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    desc = await plug.describe_image(batch_ev, md5[:8])
+    _check(desc == "tool desc", f"got: {desc!r}")
+    _check(vlm.call_count == 1, f"VLM called {vlm.call_count}, expected 1")
+    # 描述写缓存
+    cached = await db.get_image_desc_cache(md5)
+    _check(cached and cached["description"] == "tool desc",
+           f"cache: {cached['description'] if cached else 'None'}")
+
+
+@_test("T50: describe_image 历史回合 → id_map 反查缓存")
+async def _t50():
+    db = FakeDB()
+    md5 = "t50_md5_00000000000000000000000a"
+    db.seed(md5, "cached hist desc")
+    plug, mod = await _make_plugin(db, FakeVLM("vlm"),
+                                   {"load_mode": "llm_select"})
+    # 模拟历史回合：id_map 已持久化，当前 batch 无 _pir_images
+    plug._id_map[md5[:8]] = md5
+    batch_ev = FakeMessageBatchEvent([])
+
+    desc = await plug.describe_image(batch_ev, md5[:8])
+    _check(desc == "cached hist desc", f"got: {desc!r}")
+
+
+@_test("T51: describe_image 不可追溯 → 已过期")
+async def _t51():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("vlm"),
+                                   {"load_mode": "llm_select"})
+    batch_ev = FakeMessageBatchEvent([])
+    desc = await plug.describe_image(batch_ev, "deadbeef")
+    _check("已过期" in desc, f"got: {desc!r}")
+
+
+@_test("T52: ON_LLM_REQUEST 扫描替换（缓存命中）")
+async def _t52():
+    db = FakeDB()
+    md5 = "t52_md5_00000000000000000000000a"
+    db.seed(md5, "scanned desc")
+    plug, mod = await _make_plugin(db, FakeVLM("vlm"),
+                                   {"load_mode": "llm_select"})
+    plug._id_map[md5[:8]] = md5
+
+    # 历史消息里有一个空标识符
+    hist_msg = types.SimpleNamespace(
+        content=f"[Image #{md5[:8]}: ]",
+        role="user",
+    )
+    req, tool_set = _mk_tool_req(messages=[hist_msg])
+    fake_prompt = types.SimpleNamespace(name="chat_env", content="")
+    req.system_prompt.append(fake_prompt)
+
+    fake_batch_ev = FakeMessageBatchEvent([])
+    await plug.on_llm_request(fake_batch_ev, req)
+
+    _check(f"[Image #{md5[:8]}: scanned desc]" in hist_msg.content,
+           f"got: {hist_msg.content!r}")
+    # llm_select 无图消息 → describe_image 常驻（工具前缀跨消息稳定）
+    _check("describe_image" in tool_set.tools, f"tools: {tool_set.tools}")
+
+
+@_test("T53: ON_LLM_REQUEST 扫描未命中 → VLM 填充（lazy 换态）")
+async def _t53():
+    db = FakeDB()
+    vlm = FakeVLM("fill desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "lazy"})
+    md5 = "t53_md5_00000000000000000000000a"
+    plug._id_map[md5[:8]] = md5
+
+    # 历史消息空标识符 + 当前回合有原图（可 VLM）
+    hist_msg = types.SimpleNamespace(
+        content=f"[Image #{md5[:8]}: ]",
+        role="user",
+    )
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)  # lazy 模式：设占位符，无 _pir_images
+
+    # 模拟换态：把原图挂到 batch 消息的 _pir_images（llm_select 阶段1 留下的）
+    batch_msg = _make_batch_from_event(ev)
+    batch_msg._pir_images = {md5[:8]: img}
+
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    req, tool_set = _mk_tool_req(messages=[hist_msg])
+    await plug.on_llm_request(batch_ev, req)
+
+    _check(f"[Image #{md5[:8]}: fill desc]" in hist_msg.content,
+           f"got: {hist_msg.content!r}")
+    _check(vlm.call_count == 1, f"VLM called {vlm.call_count}, expected 1")
+
+
+@_test("T54: 换态工具增删（load_mode 切换 → tool_set）")
+async def _t54():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"))
+
+    # lazy 模式：describe_image 被移除
+    req, tool_set = _mk_tool_req()
+    fake_batch_ev = FakeMessageBatchEvent([])
+    await plug.on_llm_request(fake_batch_ev, req)
+    _check("describe_image" not in tool_set.tools, f"lazy tools: {tool_set.tools}")
+
+    # llm_select 模式 + 有图消息：工具保留
+    plug.load_mode = "llm_select"
+    md5 = "t54_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    req2, tool_set2 = _mk_tool_req()
+    await plug.on_llm_request(batch_ev, req2)
+    _check("describe_image" in tool_set2.tools, f"llm_select tools: {tool_set2.tools}")
+
+
+@_test("T55: 旧配置 eager_loading=true 迁移 → load_mode=eager")
+async def _t55():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                   {"eager_loading": True})
+    _check(plug.load_mode == "eager", f"load_mode: {plug.load_mode}")
+
+    plug2, mod2 = await _make_plugin(db, FakeVLM("desc"),
+                                     {"eager_loading": False})
+    _check(plug2.load_mode == "lazy", f"load_mode: {plug2.load_mode}")
+
+    plug3, mod3 = await _make_plugin(db, FakeVLM("desc"),
+                                     {"load_mode": "llm_select",
+                                      "eager_loading": True})
+    _check(plug3.load_mode == "llm_select",
+           f"load_mode should prefer explicit: {plug3.load_mode}")
+
+
+@_test("T56: id_map 1000 条 FIFO 淘汰")
+async def _t56():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                   {"load_mode": "llm_select"})
+    # 清空共享 data_dir 加载的旧映射，隔离测试
+    plug._id_map = {}
+    # 用 3 条小上限验证 FIFO（不同 md5 → 不同 short_id）
+    plug.id_map_limit = 3
+    for i in range(5):
+        full = f"{i:08x}" + "0" * 24  # 前 8 位各不相同（00000000~00000004）
+        plug._id_map_add(full[:8], full)
+    _check(len(plug._id_map) == 3, f"size: {len(plug._id_map)}")
+    # 最早写入的 0、1 被淘汰，最后写入的 3、4 保留
+    _check("00000000" not in plug._id_map, f"map: {plug._id_map}")
+    _check("00000001" not in plug._id_map, f"map: {plug._id_map}")
+    _check("00000003" in plug._id_map, f"map: {plug._id_map}")
+    _check("00000004" in plug._id_map, f"map: {plug._id_map}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 多场景 / 换态矩阵测试（v2.3.0）
+# ═══════════════════════════════════════════════════════════════
+
+@_test("T57: llm_select 多图 → 多个空标识符 + 逐张工具加载")
+async def _t57():
+    db = FakeDB()
+    vlm = FakeVLM("multi desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5s = [f"t57_{i}_" + "0" * 24 for i in range(3)]
+    imgs = [Image(md5=m) for m in md5s]
+    ev = FakeMessageEvent(imgs)
+    await plug.on_im_message(ev)
+
+    # 3 个空标识符，各带独立 id
+    _check(vlm.call_count == 0, f"VLM called {vlm.call_count}, expected 0")
+    texts = _chain_texts(ev.message.chain)
+    _check(all(f"[Image #{m[:8]}: ]" in t for t, m in zip(texts, md5s)),
+           f"chain: {texts}")
+
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    # 逐张加载：每次工具调用只 VLM 一次
+    for i, m in enumerate(md5s):
+        desc = await plug.describe_image(batch_ev, m[:8])
+        _check(desc == "multi desc", f"#{i} got: {desc!r}")
+        _check(vlm.call_count == i + 1,
+               f"VLM count after #{i}: {vlm.call_count}")
+
+
+@_test("T58: llm_select 缓存命中 → 直接带描述标识符，不进 _pir_images")
+async def _t58():
+    db = FakeDB()
+    md5 = "t58_md5_00000000000000000000000a"
+    db.seed(md5, "cached desc")
+    plug, mod = await _make_plugin(db, FakeVLM("vlm"),
+                                   {"load_mode": "llm_select"})
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+
+    _check(f"[Image #{md5[:8]}: cached desc]" == ev.message.chain[0].text,
+           f"got: {ev.message.chain[0].text!r}")
+    _check(getattr(ev.message, "_pir_images", None) is None,
+           "cache hit should not stash _pir_images")
+
+
+@_test("T59: 运行时换态 eager→llm_select→lazy 全流程")
+async def _t59():
+    """同一插件实例运行时切换 load_mode，行为应随之切换。"""
+    db = FakeDB()
+    vlm = FakeVLM("mode desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "lazy"})
+
+    # 1. lazy：阶段1 占位符，阶段2 VLM
+    md5a = "t59_a_" + "0" * 24
+    eva = FakeMessageEvent([Image(md5=md5a)])
+    await plug.on_im_message(eva)
+    _check(_is_placeholder(eva.message.chain[0].text), f"lazy: {eva.message.chain[0].text!r}")
+    batch_a = _make_batch_from_event(eva)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_a]))
+    _check(f"[Image #{md5a[:8]}: mode desc]" in batch_a.message_str,
+           f"lazy batch: {batch_a.message_str}")
+
+    # 2. 运行时切 llm_select：空标识符 + 不 VLM
+    plug.load_mode = "llm_select"
+    md5b = "t59_b_" + "0" * 24
+    evb = FakeMessageEvent([Image(md5=md5b)])
+    await plug.on_im_message(evb)
+    _check(f"[Image #{md5b[:8]}: ]" == evb.message.chain[0].text,
+           f"llm_select: {evb.message.chain[0].text!r}")
+    count_before = vlm.call_count
+    batch_b = _make_batch_from_event(evb)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_b]))
+    _check(vlm.call_count == count_before, "llm_select should not VLM in stage2")
+
+    # 3. 切回 lazy：新消息走占位符+VLM
+    plug.load_mode = "lazy"
+    md5c = "t59_c_" + "0" * 24
+    evc = FakeMessageEvent([Image(md5=md5c)])
+    await plug.on_im_message(evc)
+    _check(_is_placeholder(evc.message.chain[0].text), f"back to lazy: {evc.message.chain[0].text!r}")
+
+
+@_test("T60: llm_select 历史标识符在 eager 模式下被扫描 VLM 填充")
+async def _t60():
+    """换态到 eager：历史空标识符 + 当前回合原图 → 扫描触发 VLM。"""
+    db = FakeDB()
+    vlm = FakeVLM("eager fill")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "eager"})
+    md5 = "t60_md5_00000000000000000000000a"
+    plug._id_map[md5[:8]] = md5
+
+    # 历史消息里的空标识符（llm_select 时代留下）
+    hist_msg = types.SimpleNamespace(content=f"[Image #{md5[:8]}: ]", role="user")
+
+    # 当前回合消息带原图（模拟换态后新消息中的同一图）
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    # 模拟 llm_select 阶段1 的 _pir_images 残留（原图仍可追溯）
+    batch_msg._pir_images = {md5[:8]: img}
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    req, _ = _mk_tool_req(messages=[hist_msg])
+    await plug.on_llm_request(batch_ev, req)
+
+    _check(f"[Image #{md5[:8]}: eager fill]" in hist_msg.content,
+           f"got: {hist_msg.content!r}")
+    _check(vlm.call_count == 1, f"VLM called {vlm.call_count}, expected 1")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1377,12 +1759,16 @@ _TESTS = [
     _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40,
     # 乐观加载（v2.2.0）
     _t41, _t42, _t43, _t44, _t45, _t46,
+    # llm_select 模式（v2.3.0）
+    _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56,
+    # 多场景 / 换态矩阵（v2.3.0）
+    _t57, _t58, _t59, _t60,
 ]
 
 
 def main():
     global _PASS, _FAIL, _SKIP
-    print(f"\nParallel Image Reader v2.2.0 — 两阶段架构 + 乐观加载测试\n")
+    print(f"\nParallel Image Reader v2.3.0 — 三模式架构 + 换态矩阵测试\n")
     print(f"共 {len(_TESTS)} 个测试\n")
 
     asyncio.run(_run_all())

@@ -22,6 +22,12 @@ venv/
 # KiraAI local
 data/
 
+# Test artifacts
+_test_data/
+
+# Local tooling plans
+.zcode/
+
 # VitePress
 docs/.vitepress/dist/
 docs/.vitepress/cache/
