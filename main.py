@@ -59,13 +59,15 @@ _IMAGE_RE = re.compile(r"\[Image #([^\]\s:]+): [^\]]*\]")
 
 
 def _make_image_id(full_md5: str, existing: dict) -> str:
-    """取 md5 前缀做短标识符（8 位起），碰撞时逐位加长。"""
+    """取 md5 前缀做短标识符（8 位起），碰撞时逐位加长。纯查询，不写入。
+
+    写入统一走 _id_map_add（带 FIFO 上限）；此函数只检查现有键避免碰撞。
+    """
     prefix_len = 8
     short = full_md5[:prefix_len]
     while short in existing and existing[short] != full_md5:
         prefix_len += 2
         short = full_md5[:prefix_len]
-    existing[short] = full_md5
     return short
 
 
@@ -267,6 +269,7 @@ class ParallelImageReader(BasePlugin):
                 # 统一标识符：三模式同路径
                 if desc_cached is not None:
                     short_id = _make_image_id(md5, self._id_map)
+                    self._id_map_add(short_id, md5)  # 命中路径也写（换态反查）
                     chain_ref[idx] = Text(f"[Image #{short_id}: {desc_cached}]")
                 else:
                     if md5:
@@ -302,7 +305,7 @@ class ParallelImageReader(BasePlugin):
                     f"{cached_count} cache-hit [{session_key}]"
                 )
             if self._id_map:
-                # 新标识符已写内存映射，异步落盘（不阻塞 handler）
+                # 新标识符已写内存映射，立即落盘（1000 条上限，json.dump 开销可忽略）
                 try:
                     self._save_id_map()
                 except Exception as e:

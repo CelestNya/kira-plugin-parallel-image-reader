@@ -1788,6 +1788,32 @@ async def _t62():
            f"nested identifier leaked: {batch_msg.message_str!r}")
 
 
+@_test("T63: 真实路径 id_map FIFO 上限（on_im_message 驱动）")
+async def _t63():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                   {"load_mode": "llm_select"})
+    plug._id_map = {}
+    plug.id_map_limit = 3
+    # 5 张不同图未命中 → 全部走 _id_map_add，FIFO 淘汰最早两条
+    for i in range(5):
+        md5 = f"t63_{i}_" + "0" * 24
+        ev = FakeMessageEvent([Image(md5=md5)])
+        await plug.on_im_message(ev)
+    _check(len(plug._id_map) == 3, f"size: {len(plug._id_map)}")
+    _check("t63_0_00" not in plug._id_map, f"map: {plug._id_map}")
+    _check("t63_1_00" not in plug._id_map, f"map: {plug._id_map}")
+    _check("t63_2_00" in plug._id_map, f"map: {plug._id_map}")
+    _check("t63_4_00" in plug._id_map, f"map: {plug._id_map}")
+
+    # 缓存命中路径也写 id_map 且遵守上限（审查发现：旧实现直接写 dict 绕过 FIFO）
+    db.seed("t63_9_" + "0" * 24, "缓存描述")
+    ev = FakeMessageEvent([Image(md5="t63_9_" + "0" * 24)])
+    await plug.on_im_message(ev)
+    _check("t63_9_00" in plug._id_map, f"命中路径未写 id_map: {plug._id_map}")
+    _check(len(plug._id_map) == 3, f"上限被突破: {len(plug._id_map)}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -1820,6 +1846,8 @@ _TESTS = [
     _t61,
     # 标识符注入防御（v2.4.0）
     _t62,
+    # 审查修复：真实路径 FIFO（v2.4.0）
+    _t63,
 ]
 
 
