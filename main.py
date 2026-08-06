@@ -33,6 +33,7 @@ import base64
 import io
 import json
 import re
+from pathlib import Path
 
 from PIL import Image as PILImage
 
