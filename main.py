@@ -147,6 +147,12 @@ class ParallelImageReader(BasePlugin):
             self.plugin_cfg.get("id_map_limit") or llm_cfg.get("id_map_limit", 1000)
         )
 
+        # 转发展开层数上限（防恶意超深嵌套；深层内容无痕省略）
+        self.forward_max_depth = int(
+            self.plugin_cfg.get("forward_max_depth")
+            or ParallelImageReader._MAX_CHAIN_DEPTH
+        )
+
         self._sem = asyncio.Semaphore(self.max_concurrent)
         self._load_id_map()
 
@@ -210,12 +216,13 @@ class ParallelImageReader(BasePlugin):
 
     # ── Chain traversal ──
 
-    # 递归遍历的深度上限：防恶意超深嵌套（Forward 层层套娃）触发 RecursionError。
-    # 超深时安全降级——深层 Forward 保留原样，由核心过滤（内容丢失但不崩溃）。
+    # 递归遍历的深度上限（默认值）：防恶意超深嵌套（Forward 层层套娃）触发
+    # RecursionError。超深时安全降级——深层 Forward 保留原样，由核心过滤
+    # （内容无痕省略但不崩溃）。可配置：schema 的 forward_max_depth。
     _MAX_CHAIN_DEPTH = 64
 
     @staticmethod
-    def _flatten_forwards(chain, stack=None, depth=0):
+    def _flatten_forwards(chain, stack=None, depth=0, max_depth=None):
         """就地拍平 Forward.chains 中的嵌套 Forward，防核心渲染丢内容。
 
         KiraAI 核心 message_format_to_text 渲染 Forward 时会过滤嵌套
@@ -223,49 +230,59 @@ class ParallelImageReader(BasePlugin):
         防无限递归），导致嵌套转发的内容（含图片标识符）不进 message_str，
         LLM 看不到。插件在阶段1 先把嵌套 Forward 展开为平铺元素。
 
-        覆盖路径：Forward.chains 与 Reply.chain（转发里引用消息的图同样
-        会被核心过滤，需一并拍平）。防环：stack 记录当前展开路径上的
-        chain（id），环中子链保留 Forward 元素不展开（核心过滤兜底）。
-        深度上限 _MAX_CHAIN_DEPTH：超限保留原样（恶意超深嵌套安全降级）。
+        语义：depth=0 的顶层 chain 里的 Forward（消息本身是转发）保留壳，
+        depth>0 的嵌套 Forward 逐层展开为其子链内容。覆盖路径：
+        Forward.chains 与 Reply.chain。防环：stack 记录当前展开路径上的
+        chain（id），环中子链保留 Forward 元素（核心过滤兜底）。
+        深度上限 max_depth（默认 _MAX_CHAIN_DEPTH）：超限不展开（深层
+        内容无痕省略，恶意超深嵌套安全降级）。
         """
+        if max_depth is None:
+            max_depth = ParallelImageReader._MAX_CHAIN_DEPTH
         if stack is None:
             stack = set()
         cid = id(chain)
         if cid in stack:
             return  # 环：同一展开路径上再次出现
         stack.add(cid)
-        for ele in chain:
+        i = 0
+        while i < len(chain):
+            ele = chain[i]
             if isinstance(ele, Reply) and ele.chain is not None:
-                ParallelImageReader._flatten_forwards(
-                    ele.chain, stack, depth + 1
-                )
+                if depth < max_depth:
+                    ParallelImageReader._flatten_forwards(
+                        ele.chain, stack, depth + 1, max_depth
+                    )
             elif isinstance(ele, Forward) and ele.chains:
-                if depth < ParallelImageReader._MAX_CHAIN_DEPTH:
+                # 先递归展开每个子链（内部嵌套全部处理）；深度守卫防
+                # 恶意超深嵌套 RecursionError（超限子树不展开，语义等价）
+                if depth < max_depth:
                     for c in ele.chains:
-                        merged = []
-                        for sub in c:
-                            if isinstance(sub, Forward) and sub.chains:
-                                for subc in sub.chains:
-                                    if id(subc) in stack:
-                                        # 环：保留 Forward 元素，核心过滤兜底
-                                        merged.append(sub)
-                                    else:
-                                        ParallelImageReader._flatten_forwards(
-                                            subc, stack, depth + 1
-                                        )
-                                        merged.extend(subc)
-                            else:
-                                merged.append(sub)
-                        c[:] = merged
+                        ParallelImageReader._flatten_forwards(
+                            c, stack, depth + 1, max_depth
+                        )
+                if depth > 0 and depth < max_depth:
+                    # 嵌套 Forward：展开为其子链内容（平铺替换元素本身）
+                    expanded = []
+                    for c in ele.chains:
+                        if id(c) in stack:
+                            continue  # 环：跳过该子链（内容无痕省略）
+                        expanded.extend(c)
+                    if expanded:
+                        chain[i:i + 1] = expanded
+                        i += len(expanded) - 1
+            i += 1
         stack.remove(cid)
 
     @staticmethod
-    def _walk(chain, visited=None, depth=0):
+    def _walk(chain, visited=None, depth=0, max_depth=None):
         """递归遍历消息链（含 Reply.chain / Forward.chains），yield (chain_ref, index)。
 
         带环检测：用 id(chain_ref) 标记已访问，避免 Reply 互引导致 RecursionError。
-        深度上限 _MAX_CHAIN_DEPTH：超限跳过深层（恶意超深嵌套安全降级）。
+        深度上限 max_depth（默认 _MAX_CHAIN_DEPTH）：超限跳过深层（安全降级）。
         """
+        if max_depth is None:
+            max_depth = ParallelImageReader._MAX_CHAIN_DEPTH
         if visited is None:
             visited = set()
         cid = id(chain)
@@ -276,15 +293,15 @@ class ParallelImageReader(BasePlugin):
             if isinstance(ele, (Image, Sticker)):
                 yield chain, i
             elif isinstance(ele, Reply) and ele.chain is not None:
-                if depth < ParallelImageReader._MAX_CHAIN_DEPTH:
+                if depth < max_depth:
                     yield from ParallelImageReader._walk(
-                        ele.chain, visited, depth + 1
+                        ele.chain, visited, depth + 1, max_depth
                     )
             elif isinstance(ele, Forward) and ele.chains:
-                if depth < ParallelImageReader._MAX_CHAIN_DEPTH:
+                if depth < max_depth:
                     for c in ele.chains:
                         yield from ParallelImageReader._walk(
-                            c, visited, depth + 1
+                            c, visited, depth + 1, max_depth
                         )
 
     # ── Stage 1: ON_IM_MESSAGE — replace with identifier, stash originals ──
@@ -304,9 +321,11 @@ class ParallelImageReader(BasePlugin):
             cached_count = 0
 
             # 先拍平嵌套 Forward（防核心渲染丢内容），再遍历替换图片
-            self._flatten_forwards(event.message.chain)
+            self._flatten_forwards(event.message.chain,
+                                   max_depth=self.forward_max_depth)
 
-            for chain_ref, idx in self._walk(event.message.chain):
+            for chain_ref, idx in self._walk(event.message.chain,
+                                             max_depth=self.forward_max_depth):
                 ele = chain_ref[idx]
                 try:
                     md5 = await ele.hash_image()
@@ -437,7 +456,8 @@ class ParallelImageReader(BasePlugin):
                     if message.message_str:
                         for ph, final in fill_map.items():
                             message.message_str = message.message_str.replace(ph, final)
-                    self._replace_in_chain(message.chain, fill_map)
+                    self._replace_in_chain(message.chain, fill_map,
+                                            max_depth=self.forward_max_depth)
 
             mode = "quality" if self.quality_enabled else "native"
             logger.info(
@@ -456,8 +476,10 @@ class ParallelImageReader(BasePlugin):
     # ── Chain 标识符替换（填充）──
 
     @staticmethod
-    def _replace_in_chain(chain, fill_map: dict, visited=None, depth=0):
+    def _replace_in_chain(chain, fill_map: dict, visited=None, depth=0, max_depth=None):
         """递归遍历 chain（含 Reply/Forward），把空标识符 Text 替换为带描述 Text。"""
+        if max_depth is None:
+            max_depth = ParallelImageReader._MAX_CHAIN_DEPTH
         if visited is None:
             visited = set()
         cid = id(chain)
@@ -468,15 +490,15 @@ class ParallelImageReader(BasePlugin):
             if isinstance(ele, Text) and ele.text in fill_map:
                 chain[i] = Text(fill_map[ele.text])
             elif isinstance(ele, Reply) and ele.chain is not None:
-                if depth < ParallelImageReader._MAX_CHAIN_DEPTH:
+                if depth < max_depth:
                     ParallelImageReader._replace_in_chain(
-                        ele.chain, fill_map, visited, depth + 1
+                        ele.chain, fill_map, visited, depth + 1, max_depth
                     )
             elif isinstance(ele, Forward) and ele.chains:
-                if depth < ParallelImageReader._MAX_CHAIN_DEPTH:
+                if depth < max_depth:
                     for c in ele.chains:
                         ParallelImageReader._replace_in_chain(
-                            c, fill_map, visited, depth + 1
+                            c, fill_map, visited, depth + 1, max_depth
                         )
 
     # ── System hint + 标识符扫描替换 + 工具增删 ──

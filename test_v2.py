@@ -1901,13 +1901,53 @@ async def _t67():
     db = FakeDB()
     plug, mod = await _make_plugin(db, FakeVLM("desc"),
                                    {"load_mode": "lazy"})
-    # 迭代构造 1500 层嵌套（超过 Python 递归上限的 2 倍量级）
-    chain = FakeMessageChain([Image(md5="t67_md5_00000000000000000000000a")])
-    for _ in range(1500):
-        chain = FakeMessageChain([Forward(chains=[chain])])
-    ev = FakeMessageEvent(chain)
-    await plug.on_im_message(ev)  # 深度限制生效，不抛 RecursionError
-    _check(True, "deep nesting handled")
+    # 第 1 层（顶层 Forward 的子链）放图 + 1500 层深链：
+    # 浅层图必须被识别（阶段1 不得整体中止）
+    # 修复前：递归无守卫 → RecursionError 被吞 → 阶段1 中止 → 图全丢
+    md5 = "t67_md5_00000000000000000000000a"
+    deep = FakeMessageChain([Image(md5=md5)])
+    for _ in range(1499):
+        deep = FakeMessageChain([Forward(chains=[deep])])
+    top_chain = FakeMessageChain([Image(md5=md5), Forward(chains=[deep])])
+    ev = FakeMessageEvent(FakeMessageChain([Forward(chains=[top_chain])]))
+    await plug.on_im_message(ev)
+
+    # 顶层 Forward 保壳，第 1 层 Forward 展开 → 浅层图被替换为 Text
+    # （深层 64+ 保留 Forward 壳，无痕省略——安全降级而非整体中止）
+    top = ev.message.chain[0].chains[0]
+    top_types = [type(e).__name__ for e in top]
+    _check("Text" in top_types, f"shallow image should be identified: {top_types}")
+    _check("Image" not in top_types, f"shallow image not replaced: {top_types}")
+
+
+@_test("T68: forward_max_depth 配置生效（隔断层数）")
+async def _t68():
+    db = FakeDB()
+    md5 = "t68_md5_00000000000000000000000a"
+
+    async def run_with(cfg):
+        plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                       {"load_mode": "lazy", **cfg})
+        l3 = FakeMessageChain([Image(md5=md5), Text("三层")])
+        l2 = FakeMessageChain([Text("二层"), Forward(chains=[l3])])
+        l1 = FakeMessageChain([Text("一层"), Forward(chains=[l2])])
+        ev = FakeMessageEvent(FakeMessageChain([Forward(chains=[l1])]))
+        await plug.on_im_message(ev)
+        # 拍平作用在 event.message.chain（包装对象），取其 Forward.chains[0]
+        flattened = ev.message.chain[0].chains[0]
+        return plug, [type(e).__name__ for e in flattened]
+
+    # depth=2：L2 内容展开进 L1，L3 保留 Forward 壳（真实核心渲染时无痕过滤）
+    plug1, types1 = await run_with({"forward_max_depth": 2})
+    _check(plug1.forward_max_depth == 2, f"depth: {plug1.forward_max_depth}")
+    _check(types1 == ["Text", "Text", "Forward"],
+           f"depth=2 should keep L3 shell: {types1}")
+
+    # 默认 64：三层全展开（Image 已被替换为 Text 标识符）
+    plug2, types2 = await run_with({})
+    _check(plug2.forward_max_depth == 64, f"default depth: {plug2.forward_max_depth}")
+    _check(types2 == ["Text", "Text", "Text", "Text"],
+           f"default should expand all: {types2}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1948,6 +1988,8 @@ _TESTS = [
     _t64, _t65,
     # 审查补漏：Reply 内 Forward / 超深嵌套（issue #1）
     _t66, _t67,
+    # 转发展开层数配置（v2.4.2）
+    _t68,
 ]
 
 
