@@ -200,6 +200,44 @@ class ParallelImageReader(BasePlugin):
     # ── Chain traversal ──
 
     @staticmethod
+    def _flatten_forwards(chain, stack=None):
+        """就地拍平 Forward.chains 中的嵌套 Forward，防核心渲染丢内容。
+
+        KiraAI 核心 message_format_to_text 渲染 Forward 时会过滤嵌套
+        Forward 元素（[x for x in chain if not isinstance(x, Forward)]，
+        防无限递归），导致嵌套转发的内容（含图片标识符）不进 message_str，
+        LLM 看不到。插件在阶段1 先把嵌套 Forward 展开为平铺元素。
+
+        防环：stack 记录当前展开路径上的 chain（id），环中子链保留
+        Forward 元素不展开（核心过滤兜底，安全降级）。非环嵌套全部展开。
+        """
+        if stack is None:
+            stack = set()
+        cid = id(chain)
+        if cid in stack:
+            return  # 环：同一展开路径上再次出现
+        stack.add(cid)
+        for ele in chain:
+            if isinstance(ele, Forward) and ele.chains:
+                for c in ele.chains:
+                    ParallelImageReader._flatten_forwards(c, stack)
+                for c in ele.chains:
+                    merged = []
+                    for sub in c:
+                        if isinstance(sub, Forward) and sub.chains:
+                            for subc in sub.chains:
+                                if id(subc) in stack:
+                                    # 环：保留 Forward 元素，核心过滤兜底
+                                    merged.append(sub)
+                                else:
+                                    ParallelImageReader._flatten_forwards(subc, stack)
+                                    merged.extend(subc)
+                        else:
+                            merged.append(sub)
+                    c[:] = merged
+        stack.remove(cid)
+
+    @staticmethod
     def _walk(chain, visited=None):
         """递归遍历消息链（含 Reply.chain / Forward.chains），yield (chain_ref, index)。
 
@@ -235,6 +273,9 @@ class ParallelImageReader(BasePlugin):
         try:
             db = self.ctx.db
             cached_count = 0
+
+            # 先拍平嵌套 Forward（防核心渲染丢内容），再遍历替换图片
+            self._flatten_forwards(event.message.chain)
 
             for chain_ref, idx in self._walk(event.message.chain):
                 ele = chain_ref[idx]

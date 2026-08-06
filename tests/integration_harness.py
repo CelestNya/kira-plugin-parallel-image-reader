@@ -555,6 +555,64 @@ async def _test_stress_cache_hit():
         await h.stop()
 
 
+async def _test_forward_nested():
+    """Forward 转发：嵌套 Forward 内容不丢失，图片全部识别（issue #1）。"""
+    from core.chat.message_elements import Forward, Text, Image
+    from core.chat.message_utils import MessageChain
+
+    h = Harness(load_mode="lazy")
+    await h.start()
+    try:
+        # 三层嵌套：外层 Forward → 中层 → 内层含图
+        inner = MessageChain([Image(image=f"base64://{_PNG_B64}"), Text("深层转发")])
+        mid = MessageChain([Text("外层转发"), Forward(chains=[inner])])
+        outer = MessageChain([Forward(chains=[mid])])
+        ev = h.make_image_event(chain=outer, message_id="fwd-nested")
+        await h.run_im(ev)
+
+        batch = await h.run_batch()
+        assert batch is not None, "batch not produced"
+        msg_str = batch.messages[0].message_str
+        assert "深层转发" in msg_str, f"nested content lost: {msg_str!r}"
+        assert "外层转发" in msg_str, f"outer content lost: {msg_str!r}"
+        assert "[Image #" in msg_str, f"image identifier missing: {msg_str!r}"
+        print("  [OK] Forward 嵌套：内容不丢失，图片全识别")
+
+        # 历史持久化同样完整
+        mem = h.get_memory("qq:gm:test_session")
+        joined = "".join(m.get("content", "") for m in mem)
+        assert "[Image #" in joined and "深层转发" in joined, \
+            f"history incomplete: {joined[:200]!r}"
+        print("  [OK] Forward 嵌套历史：完整持久化")
+    finally:
+        await h.stop()
+
+
+async def _test_forward_cycle():
+    """恶意输入：Forward 成环不崩溃，不无限递归（issue #1 边界）。"""
+    from core.chat.message_elements import Forward, Text, Image
+    from core.chat.message_utils import MessageChain
+
+    h = Harness(load_mode="lazy")
+    await h.start()
+    try:
+        c1 = MessageChain([Image(image=f"base64://{_PNG_B64}"), Text("环1")])
+        c2 = MessageChain([Text("环2")])
+        c1.append(Forward(chains=[c2]))
+        c2.append(Forward(chains=[c1]))  # c1 → c2 → c1 成环
+        ev = h.make_image_event(chain=MessageChain([Forward(chains=[c1])]),
+                                message_id="fwd-cycle")
+        await h.run_im(ev)  # 不崩溃即通过（核心/插件双防环）
+
+        batch = await h.run_batch()
+        assert batch is not None, "batch not produced"
+        msg_str = batch.messages[0].message_str
+        assert "环1" in msg_str or "环2" in msg_str, f"cycle content: {msg_str!r}"
+        print("  [OK] Forward 成环：不崩溃，内容部分保留（安全降级）")
+    finally:
+        await h.stop()
+
+
 async def main():
     print("\nKiraAI 集成测试 harness（真实核心管线 + 真实插件）\n")
     tests = [
@@ -564,6 +622,8 @@ async def main():
         ("换态矩阵", _test_switch_matrix),
         ("压测：30图并发", _test_stress_multi_image),
         ("压测：缓存命中", _test_stress_cache_hit),
+        ("Forward 嵌套", _test_forward_nested),
+        ("Forward 成环", _test_forward_cycle),
     ]
     passed = 0
     for name, fn in tests:
