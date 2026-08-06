@@ -1950,6 +1950,34 @@ async def _t68():
            f"default should expand all: {types2}")
 
 
+@_test("T69: llm_select 当前回合空标识符不被误标已过期")
+async def _t69():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t69_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)              # 空标识符 + _pir_images 挂原图
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)  # llm_select 跳过，空标识符进历史
+
+    # 当前回合消息进 user_prompt → ON_LLM_REQUEST 扫描：
+    # 原图可追溯（describe_image 可用）→ 必须保持空，不得误标"已过期"
+    # 注意：user_prompt 扫描用 isinstance(p, Prompt)，必须用真实 Prompt 实例
+    mod, _ = load_plugin()
+    req, tool_set = _mk_tool_req()
+    fake_prompt = mod.Prompt(content=batch_msg.message_str, name="message")
+    req.user_prompt.append(fake_prompt)
+    await plug.on_llm_request(batch_ev, req)
+    _check(f"[Image #{md5[:8]}: ]" in fake_prompt.content,
+           f"should stay empty: {fake_prompt.content!r}")
+    _check("已过期" not in fake_prompt.content,
+           f"must not be marked expired: {fake_prompt.content!r}")
+    _check(vlm.call_count == 0, f"llm_select must not VLM: {vlm.call_count}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -1990,6 +2018,8 @@ _TESTS = [
     _t66, _t67,
     # 转发展开层数配置（v2.4.2）
     _t68,
+    # llm_select 误标已过期（v2.4.3）
+    _t69,
 ]
 
 

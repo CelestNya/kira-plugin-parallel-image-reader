@@ -616,7 +616,11 @@ class ParallelImageReader(BasePlugin):
             if images_map and short_id in images_map:
                 ele = images_map[short_id]
                 break
-        if ele is not None and self.load_mode != "llm_select":
+        if ele is not None:
+            if self.load_mode == "llm_select":
+                # llm_select：当前回合原图可追溯（describe_image 工具可用），
+                # 保持空标识符，不得误标"已过期"
+                return m.group(0)
             desc = await self._describe_one(0, ele, session_key, 1)
             if desc:
                 return f"[Image #{short_id}: {desc}]"
