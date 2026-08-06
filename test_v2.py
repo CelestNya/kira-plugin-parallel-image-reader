@@ -1978,6 +1978,52 @@ async def _t69():
     _check(vlm.call_count == 0, f"llm_select must not VLM: {vlm.call_count}")
 
 
+@_test("T70: llm_select 历史空标识符（不可追溯）→ 已过期（回归）")
+async def _t70():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    # 历史消息里的空标识符：无原图（不在 _pir_images）、无 id_map、无缓存
+    hist_msg = types.SimpleNamespace(
+        content="[Image #deadbeef: ]",
+        role="user",
+    )
+    req, tool_set = _mk_tool_req(messages=[hist_msg])
+    fake_prompt = types.SimpleNamespace(name="chat_env", content="")
+    req.system_prompt.append(fake_prompt)
+    batch_ev = FakeMessageBatchEvent([])
+    await plug.on_llm_request(batch_ev, req)
+    _check("[Image #deadbeef: 已过期]" in hist_msg.content,
+           f"history should be expired: {hist_msg.content!r}")
+    _check(vlm.call_count == 0, f"must not VLM: {vlm.call_count}")
+
+
+@_test("T71: llm_select hash 失败图（noid_）当前回合保持空")
+async def _t71():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+
+    class _BrokenImage(Image):
+        async def hash_image(self):
+            raise RuntimeError("chaos hash")
+
+    img = _BrokenImage(md5="t71_md5_00000000000000000000000a")
+    ev = FakeMessageEvent([img])
+    await plug.on_im_message(ev)  # noid_ 空标识符 + _pir_images 挂原图
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    req, tool_set = _mk_tool_req()
+    mod2, _ = load_plugin()
+    fake_prompt = mod2.Prompt(content=batch_msg.message_str, name="message")
+    req.user_prompt.append(fake_prompt)
+    await plug.on_llm_request(batch_ev, req)
+    _check("已过期" not in fake_prompt.content,
+           f"noid_ should stay empty: {fake_prompt.content!r}")
+    _check(vlm.call_count == 0, f"must not VLM: {vlm.call_count}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -2020,6 +2066,8 @@ _TESTS = [
     _t68,
     # llm_select 误标已过期（v2.4.3）
     _t69,
+    # v2.4.3 review 补测：历史已过期回归 / noid_ 保持空
+    _t70, _t71,
 ]
 
 

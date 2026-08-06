@@ -511,8 +511,9 @@ class ParallelImageReader(BasePlugin):
         - llm_select 模式：describe_image 常驻——有图/无图消息工具集一致，
           避免工具前缀抖动破坏 LLM 上下文缓存（缓存按请求前缀精确匹配）
         - 所有模式：扫描 req.messages + user_prompt 中的 [Image #id: ] 空标识符：
-          缓存命中 → 填描述；未命中且可追溯（当前回合有原图）且 lazy/eager →
-          触发 VLM；不可追溯 → "已过期"
+          缓存命中 → 填描述；未命中且可追溯（当前回合有原图）→ lazy/eager
+          触发 VLM，llm_select 保持空（LLM 可调 describe_image 加载）；
+          不可追溯 → "已过期"
         """
         try:
             # 1. 换态工具增删（模仿 file 插件 filter_tools 模式）
@@ -579,7 +580,8 @@ class ParallelImageReader(BasePlugin):
         规则：
         - 内容非空（已有描述/已过期）→ 跳过
         - 空内容 + 缓存命中 → 填描述
-        - 空内容 + 未命中 + 当前回合有原图（_pir_images）→ 触发 VLM（lazy/eager 换态）
+        - 空内容 + 未命中 + 当前回合有原图（_pir_images）：
+          lazy/eager → 触发 VLM 填充；llm_select → 保持空（工具可加载）
         - 空内容 + 不可追溯 → "已过期"
         """
         # re.sub 无法 await，手写异步替换循环
