@@ -1910,6 +1910,36 @@ async def _t67():
     _check(True, "deep nesting handled")
 
 
+@_test("T68: forward_max_depth 配置生效（隔断层数）")
+async def _t68():
+    db = FakeDB()
+    md5 = "t68_md5_00000000000000000000000a"
+
+    async def run_with(cfg):
+        plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                       {"load_mode": "lazy", **cfg})
+        l3 = FakeMessageChain([Image(md5=md5), Text("三层")])
+        l2 = FakeMessageChain([Text("二层"), Forward(chains=[l3])])
+        l1 = FakeMessageChain([Text("一层"), Forward(chains=[l2])])
+        ev = FakeMessageEvent(FakeMessageChain([Forward(chains=[l1])]))
+        await plug.on_im_message(ev)
+        # 拍平作用在 event.message.chain（包装对象），取其 Forward.chains[0]
+        flattened = ev.message.chain[0].chains[0]
+        return plug, [type(e).__name__ for e in flattened]
+
+    # depth=2：L2 内容展开进 L1，L3 保留 Forward 壳（真实核心渲染时无痕过滤）
+    plug1, types1 = await run_with({"forward_max_depth": 2})
+    _check(plug1.forward_max_depth == 2, f"depth: {plug1.forward_max_depth}")
+    _check(types1 == ["Text", "Text", "Forward"],
+           f"depth=2 should keep L3 shell: {types1}")
+
+    # 默认 64：三层全展开（Image 已被替换为 Text 标识符）
+    plug2, types2 = await run_with({})
+    _check(plug2.forward_max_depth == 64, f"default depth: {plug2.forward_max_depth}")
+    _check(types2 == ["Text", "Text", "Text", "Text"],
+           f"default should expand all: {types2}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -1948,6 +1978,8 @@ _TESTS = [
     _t64, _t65,
     # 审查补漏：Reply 内 Forward / 超深嵌套（issue #1）
     _t66, _t67,
+    # 转发展开层数配置（v2.4.2）
+    _t68,
 ]
 
 

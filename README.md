@@ -44,6 +44,7 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 
 ## 版本记录
 
+- **v2.4.2** — 转发展开层数配置化（forward_max_depth，默认 64）；修复深层嵌套转发只展开一层的层级 bug
 - **v2.4.1** — 修复嵌套 Forward 内容丢失（issue #1）：阶段1 拍平嵌套转发（含 Reply 内），递归深度上限防恶意超深嵌套
 - **v2.4.0** — 统一标识符架构重构：三模式阶段1 完全统一，删除过渡占位符机制；describe_image 工具在 llm_select 下常驻（保护 LLM 上下文缓存命中）；VLM 输出消毒（污染/嵌套标识符描述不入缓存）+ 混沌测试套件；id_map 上限 FIFO 生效
 - **v2.3.0** — 三种加载模式（load_mode 三态），新增 LLM 选择性加载（describe_image 工具）；三模式统一标识符格式 `[Image #id: ...]`；换态时历史标识符自动扫描替换
