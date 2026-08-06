@@ -112,6 +112,16 @@ class ParallelImageReader(BasePlugin):
         # short_id → full_md5 映射（llm_select 模式历史反查用）
         self._id_map: dict[str, str] = {}
 
+    @staticmethod
+    def _plugin_version() -> str:
+        """从 manifest.json 读取版本（日志用，避免硬编码过期）。"""
+        try:
+            path = Path(__file__).resolve().parent / "manifest.json"
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f).get("version", "?")
+        except Exception:
+            return "?"
+
     # ── Lifecycle ──
 
     async def initialize(self):
@@ -140,7 +150,7 @@ class ParallelImageReader(BasePlugin):
         self._load_id_map()
 
         logger.info(
-            f"[ParallelImageReader] v2.4.0 initialized: "
+            f"[ParallelImageReader] v{self._plugin_version()} initialized: "
             f"mode={self.load_mode}, max_concurrent={self.max_concurrent}, "
             f"quality={'on(' + str(self.quality_value) + ')' if self.quality_enabled else 'off'}"
         )
