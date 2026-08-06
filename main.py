@@ -153,6 +153,16 @@ class ParallelImageReader(BasePlugin):
             or ParallelImageReader._MAX_CHAIN_DEPTH
         )
 
+        # llm_select 自动读取开关（schema auto_read_config section）：
+        # 私聊单图 / 被@提及或引用含图消息 → 默认读取，不等待 LLM 决策
+        auto_cfg = self.plugin_cfg.get("auto_read_config") or {}
+        self.private_single_auto_read = bool(
+            auto_cfg.get("private_single_auto_read", True)
+        )
+        self.mention_reply_auto_read = bool(
+            auto_cfg.get("mention_reply_auto_read", True)
+        )
+
         self._sem = asyncio.Semaphore(self.max_concurrent)
         self._load_id_map()
 
@@ -424,9 +434,17 @@ class ParallelImageReader(BasePlugin):
                 images_map = getattr(message, "_pir_images", None)
                 if not images_map:
                     continue  # 无图或全缓存命中
-                # llm_select：空标识符改写为 (未识别) 系统状态标记后进历史，
-                # 不 VLM（LLM 可分辨状态并调 describe_image 工具加载）
+                # llm_select：满足自动读取条件 → 走 VLM 填充（同 lazy 路径）；
+                # 否则空标识符改写为 (未识别) 系统状态标记后进历史
                 if self.load_mode == "llm_select":
+                    if self._should_auto_read(message, event, images_map):
+                        groups.append((
+                            message, images_map,
+                            self._describe_parallel(
+                                list(images_map.values()), session_key
+                            ),
+                        ))
+                        continue
                     mark_map = {
                         f"[Image #{short_id}: ]": f"[Image #{short_id}: (未识别)]"
                         for short_id in images_map
@@ -486,6 +504,56 @@ class ParallelImageReader(BasePlugin):
             )
 
     # ── Chain 标识符替换（填充）──
+
+    def _should_auto_read(self, message, event, images_map: dict) -> bool:
+        """llm_select 自动读取判定：私聊单图 / 被@提及 / 引用含图消息。
+
+        这些场景图片是明确给 bot 看的（无 LLM 决策空间），默认读取
+        提升体验；其余场景保持 (未识别) 由 LLM 决定。
+        """
+        # 私聊单图：私聊对话且整批只有一条消息且只有一张图
+        if self.private_single_auto_read:
+            try:
+                if not event.is_group_message() \
+                        and len(event.messages) == 1 \
+                        and len(images_map) == 1:
+                    return True
+            except Exception:
+                pass  # 事件缺属性（防御），退回常规判定
+        # 被@提及：消息明确 @ 了 bot
+        if self.mention_reply_auto_read:
+            if getattr(message, "is_mentioned", False):
+                return True
+            # 引用含图消息：Reply 内容里有图片标识符（阶段1 已替换）
+            if self._reply_chain_has_image(message.chain):
+                return True
+        return False
+
+    @staticmethod
+    def _reply_chain_has_image(chain, visited=None) -> bool:
+        """消息链中是否存在引用（Reply）且其内容含图片标识符。
+
+        注意不能依赖 _walk：_walk 只 yield Image/Sticker，不 yield Reply
+        元素本身（递归进入其 chain）——需直接遍历查找 Reply。
+        """
+        if visited is None:
+            visited = set()
+        cid = id(chain)
+        if cid in visited:
+            return False
+        visited.add(cid)
+        for ele in chain:
+            if isinstance(ele, Reply) and ele.chain is not None:
+                for sub in ele.chain:
+                    if isinstance(sub, Text) and "[Image #" in sub.text:
+                        return True
+                if ParallelImageReader._reply_chain_has_image(ele.chain, visited):
+                    return True
+            elif isinstance(ele, Forward) and ele.chains:
+                for c in ele.chains:
+                    if ParallelImageReader._reply_chain_has_image(c, visited):
+                        return True
+        return False
 
     @staticmethod
     def _replace_in_chain(chain, fill_map: dict, visited=None, depth=0, max_depth=None):

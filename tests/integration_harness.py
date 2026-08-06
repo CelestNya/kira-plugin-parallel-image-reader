@@ -388,7 +388,7 @@ async def _test_llm_select_full_pipeline():
     ])
     await h.start()
     try:
-        ev = h.make_image_event(message_id="llm1")
+        ev = h.make_image_event(message_id="llm1", mentioned=False)
         await h.run_im(ev)
 
         # 阶段1：空标识符 [Image #id: ]（id 是真实 md5 前 8 位）
@@ -469,7 +469,7 @@ async def _test_switch_matrix():
         # 2. 运行时切 llm_select → (未识别) 系统状态进历史，不 VLM
         h.plugin.load_mode = "llm_select"
         vlm_before = h.vlm.call_count
-        ev2 = h.make_image_event(message_id="sw2",
+        ev2 = h.make_image_event(message_id="sw2", mentioned=False,
                                  chain=h._make_chain_with_image(_png_b64_variant(2)))
         await h.run_im(ev2)
         batch2 = await h.run_batch()

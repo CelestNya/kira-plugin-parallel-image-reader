@@ -124,8 +124,9 @@ KiraAI 插件，作为 `data/plugins/parallel_image_reader` 目录加载（symli
 │
 ├─ 遍历 event.messages：
 │   ├─ _pir_images 空 → 跳过（无图/全缓存命中）
-│   ├─ load_mode == llm_select → 空标识符改写为 (未识别) 系统状态标记
-│   │   进历史（不 VLM，LLM 可调 describe_image 加载）
+│   ├─ load_mode == llm_select → 满足自动读取（私聊单图/被@/引用含图消息，
+│   │   开关 auto_read_config）→ 走 VLM 填充（同 lazy）；否则空标识符改写为
+│   │   (未识别) 系统状态标记进历史（不 VLM，LLM 可调 describe_image 加载）
 │   └─ 否则（lazy/eager）→ 加入 groups：
 │       ├─ 有 _pir_optimistic（eager 提前启动）→ groups.append((msg, images_map, task))
 │       └─ 无（lazy 现场）→ groups.append((msg, images_map, _describe_parallel(...)))

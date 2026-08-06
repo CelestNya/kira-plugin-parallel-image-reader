@@ -45,6 +45,8 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 
 ## 版本记录
 
+- **v2.4.5** — llm_select 自动读取：私聊单图 / 被@提及 / 引用含图消息默认读取（auto_read_config 开关组）
+- **v2.4.4** — describe_image 工具批量化：多图一次调用并行加载（逗号分隔多 id）
 - **v2.4.3** — 修复 llm_select 当前回合空标识符误标"已过期"；系统状态括号化：待加载显示 `(未识别)`、不可追溯显示 `(已过期)`（括号=系统状态，与图片内容区分）
 - **v2.4.2** — 转发展开层数配置化（forward_max_depth，默认 64）；修复深层嵌套转发只展开一层的层级 bug
 - **v2.4.1** — 修复嵌套 Forward 内容丢失（issue #1）：阶段1 拍平嵌套转发（含 Reply 内），递归深度上限防恶意超深嵌套

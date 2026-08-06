@@ -61,6 +61,26 @@ JPEG 压缩质量，仅在 `quality_enabled` 开启时生效。
 
 ---
 
+## auto_read_config（自动读取）
+
+折叠分组，`load_mode=llm_select` 时生效：这些场景图片明确是给 bot 看的（无 LLM 决策空间），直接读取，不等 LLM 决定。
+
+### private_single_auto_read
+
+- **类型**: `switch`
+- **默认**: `true`
+
+私聊对话中只出现一张图时直接读取（不等待 LLM 调工具）。
+
+### mention_reply_auto_read
+
+- **类型**: `switch`
+- **默认**: `true`
+
+被 @ 提及，或引用（Reply）含图消息时，直接读取图片。
+
+---
+
 ## id_map_limit
 
 - **类型**: `integer`

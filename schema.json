@@ -62,5 +62,43 @@
                 "hint": "合并转发（Forward）嵌套展开的最大层数，超限的深层内容无痕省略（防恶意超深嵌套导致递归崩溃）"
             }
         }
+    },
+    "auto_read_config": {
+        "type": "section",
+        "name": "自动读取",
+        "collapsed": true,
+        "hint": "llm_select 模式下默认读取图片的场景（无需 LLM 决策）",
+        "fields": {
+            "private_single_auto_read": {
+                "type": "switch",
+                "name": "私聊单图自动读取",
+                "default": true,
+                "hint": "私聊对话中只出现一张图时直接读取，不等待 LLM 决定",
+                "locales": {
+                    "zh": {
+                        "name": "私聊单图自动读取",
+                        "hint": "私聊对话中只出现一张图时直接读取，不等待 LLM 决定"
+                    }
+                }
+            },
+            "mention_reply_auto_read": {
+                "type": "switch",
+                "name": "被@/引用自动读取",
+                "default": true,
+                "hint": "被@提及或引用含图消息时直接读取图片",
+                "locales": {
+                    "zh": {
+                        "name": "被@/引用自动读取",
+                        "hint": "被@提及或引用含图消息时直接读取图片"
+                    }
+                }
+            }
+        },
+        "locales": {
+            "zh": {
+                "name": "自动读取",
+                "hint": "llm_select 模式下默认读取图片的场景（无需 LLM 决策）"
+            }
+        }
     }
 }
