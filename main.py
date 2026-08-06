@@ -553,9 +553,10 @@ class ParallelImageReader(BasePlugin):
                 hint = (
                     "当消息中包含 [Image #xxxx: (未识别)] 格式的标记时，"
                     "这表示用户发送了一张图片，其内容尚未加载。如需了解图片"
-                    "内容，请调用 describe_image 工具并传入标识符中的 xxxx。"
-                    "已加载的图片会显示为 [Image #xxxx: 描述内容]，不可追溯的"
-                    "会显示为 [Image #xxxx: (已过期)]。"
+                    "内容，请调用 describe_image 工具并传入标识符中的 xxxx；"
+                    "多张图片可一次传入多个标识符（英文逗号分隔）批量加载，"
+                    "避免多次调用。已加载的图片会显示为 [Image #xxxx: 描述内容]，"
+                    "不可追溯的会显示为 [Image #xxxx: (已过期)]。"
                     "注意：括号内为系统状态（未识别/已过期），不是图片内容。"
                 )
             else:
@@ -652,36 +653,53 @@ class ParallelImageReader(BasePlugin):
 
     @register.tool(
         "describe_image",
-        "获取图片内容描述。当消息中包含 [Image #xxxx: ] 格式标识符且你需要了解图片内容时调用，传入标识符中的 xxxx。",
+        "获取图片内容描述。当消息中包含 [Image #xxxx: (未识别)] 格式标识符且你需要了解图片内容时调用，传入标识符中的 xxxx。可一次传入多个标识符（英文逗号分隔）批量加载，避免多图时反复调用。",
         {
             "type": "object",
             "properties": {
-                "image_id": {"type": "string", "description": "图片标识符（[Image #xxxx: ] 中的 xxxx）"},
+                "image_id": {"type": "string",
+                             "description": "图片标识符（[Image #xxxx: ] 中的 xxxx），多个用英文逗号分隔，如 \"abc123,def456\""},
             },
             "required": ["image_id"],
         },
     )
     async def describe_image(self, event: KiraMessageBatchEvent, image_id: str) -> str:
-        """LLM 按需加载图片描述：当前回合原图 → 缓存/VLM；历史回合 → id_map 反查缓存。"""
+        """批量加载图片描述：逗号分隔多个 id，并行 VLM/缓存，返回逐图描述。
+
+        多图场景一次工具调用全部加载（KiraAI 工具循环上限默认 2 步，
+        单图调用会导致 LLM 反复 react 且串行读取）。
+        """
+        ids = [i.strip() for i in (image_id or "").split(",") if i.strip()]
+        if not ids:
+            return "图片已过期或不可追溯"
         session_key = getattr(event, "sid", None) or "tool"
-        # 1. 当前回合：_pir_images 找原图 → 缓存/VLM
-        for msg in getattr(event, "messages", []) or []:
-            images_map = getattr(msg, "_pir_images", None)
-            if images_map and image_id in images_map:
-                ele = images_map[image_id]
-                desc = await self._describe_one(0, ele, session_key, 1)
-                return desc or "图片描述不可用"
-        # 2. 历史回合：id_map → 缓存
-        full_md5 = self._id_map.get(image_id)
-        if full_md5:
-            try:
-                entry = await self.ctx.db.get_image_desc_cache(full_md5)
-                if entry and entry.get("description") \
-                        and _is_valid_desc(entry["description"]):
-                    return entry["description"]
-            except Exception as e:
-                logger.debug(f"[ParallelImageReader] describe_image cache query failed: {e}")
-        return "图片已过期或不可追溯"
+
+        async def _load_one(iid: str) -> str:
+            # 1. 当前回合：_pir_images 找原图 → 缓存/VLM
+            for msg in getattr(event, "messages", []) or []:
+                images_map = getattr(msg, "_pir_images", None)
+                if images_map and iid in images_map:
+                    desc = await self._describe_one(
+                        0, images_map[iid], session_key, len(ids)
+                    )
+                    return (f"[Image #{iid}: {desc}]" if desc
+                            else f"[Image #{iid}: 图片描述不可用]")
+            # 2. 历史回合：id_map → 缓存
+            full_md5 = self._id_map.get(iid)
+            if full_md5:
+                try:
+                    entry = await self.ctx.db.get_image_desc_cache(full_md5)
+                    if entry and entry.get("description") \
+                            and _is_valid_desc(entry["description"]):
+                        return f"[Image #{iid}: {entry['description']}]"
+                except Exception as e:
+                    logger.debug(
+                        f"[ParallelImageReader] describe_image cache query failed: {e}"
+                    )
+            return f"[Image #{iid}: 图片已过期或不可追溯]"
+
+        results = await asyncio.gather(*[_load_one(i) for i in ids])
+        return "\n".join(results)
 
     # ── VLM call with JPEG compression ──
 

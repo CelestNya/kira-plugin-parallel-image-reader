@@ -1469,7 +1469,7 @@ async def _t49():
     batch_ev = FakeMessageBatchEvent([batch_msg])
 
     desc = await plug.describe_image(batch_ev, md5[:8])
-    _check(desc == "tool desc", f"got: {desc!r}")
+    _check(desc == f"[Image #{md5[:8]}: tool desc]", f"got: {desc!r}")
     _check(vlm.call_count == 1, f"VLM called {vlm.call_count}, expected 1")
     # 描述写缓存
     cached = await db.get_image_desc_cache(md5)
@@ -1489,7 +1489,7 @@ async def _t50():
     batch_ev = FakeMessageBatchEvent([])
 
     desc = await plug.describe_image(batch_ev, md5[:8])
-    _check(desc == "cached hist desc", f"got: {desc!r}")
+    _check(desc == f"[Image #{md5[:8]}: cached hist desc]", f"got: {desc!r}")
 
 
 @_test("T51: describe_image 不可追溯 → 已过期")
@@ -1663,10 +1663,10 @@ async def _t57():
     batch_msg = _make_batch_from_event(ev)
     batch_ev = FakeMessageBatchEvent([batch_msg])
 
-    # 逐张加载：每次工具调用只 VLM 一次
+    # 逐张加载：每次工具调用只 VLM 一次（返回带 id 格式）
     for i, m in enumerate(md5s):
         desc = await plug.describe_image(batch_ev, m[:8])
-        _check(desc == "multi desc", f"#{i} got: {desc!r}")
+        _check(desc == f"[Image #{m[:8]}: multi desc]", f"#{i} got: {desc!r}")
         _check(vlm.call_count == i + 1,
                f"VLM count after #{i}: {vlm.call_count}")
 
@@ -2026,6 +2026,40 @@ async def _t71():
            f"must not VLM: {vlm.call_count}")
 
 
+@_test("T72: describe_image 批量调用（多 id 并行）")
+async def _t72():
+    db = FakeDB()
+    vlm = FakeVLM("批量描述")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5s = [f"t72_{i}_" + "0" * 24 for i in range(3)]
+    imgs = [Image(md5=m) for m in md5s]
+    ev = FakeMessageEvent(imgs)
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    batch_ev = FakeMessageBatchEvent([batch_msg])
+
+    # 一次调用传 3 个 id（逗号分隔）→ 并行 VLM，返回逐图描述
+    desc = await plug.describe_image(
+        batch_ev, ",".join(m[:8] for m in md5s))
+    _check(vlm.call_count == 3, f"VLM called {vlm.call_count}, expected 3")
+    for m in md5s:
+        _check(f"[Image #{m[:8]}: 批量描述]" in desc, f"missing {m[:8]}: {desc!r}")
+
+    # 混合：当前回合 2 个 + 历史 1 个（缓存命中）+ 1 个不可追溯
+    db.seed(md5s[2], "历史缓存描述")
+    desc2 = await plug.describe_image(
+        batch_ev, f"{md5s[0][:8]},{md5s[2][:8]},deadbeef")
+    _check(f"[Image #{md5s[0][:8]}: 批量描述]" in desc2, f"got: {desc2!r}")
+    _check(f"[Image #{md5s[2][:8]}: 历史缓存描述]" in desc2, f"got: {desc2!r}")
+    _check("[Image #deadbeef: 图片已过期或不可追溯]" in desc2, f"got: {desc2!r}")
+
+    # 空参数/纯逗号 → 不可追溯
+    _check("图片已过期或不可追溯" in await plug.describe_image(batch_ev, ""),
+           "empty arg")
+    _check("图片已过期或不可追溯" in await plug.describe_image(batch_ev, " , "),
+           "blank arg")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -2070,6 +2104,8 @@ _TESTS = [
     _t69,
     # v2.4.3 review 补测：历史已过期回归 / noid_ 保持空
     _t70, _t71,
+    # 工具批量调用（v2.4.4）
+    _t72,
 ]
 
 
