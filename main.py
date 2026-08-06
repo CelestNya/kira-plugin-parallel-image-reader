@@ -424,8 +424,20 @@ class ParallelImageReader(BasePlugin):
                 images_map = getattr(message, "_pir_images", None)
                 if not images_map:
                     continue  # 无图或全缓存命中
-                # llm_select：空标识符合法进历史（最终态），不 VLM
+                # llm_select：空标识符改写为 (未识别) 系统状态标记后进历史，
+                # 不 VLM（LLM 可分辨状态并调 describe_image 工具加载）
                 if self.load_mode == "llm_select":
+                    mark_map = {
+                        f"[Image #{short_id}: ]": f"[Image #{short_id}: (未识别)]"
+                        for short_id in images_map
+                    }
+                    if message.message_str:
+                        for old, new in mark_map.items():
+                            message.message_str = message.message_str.replace(old, new)
+                    self._replace_in_chain(
+                        message.chain, mark_map,
+                        max_depth=self.forward_max_depth,
+                    )
                     continue
                 # eager 复用阶段1 提前启动的 task；lazy 现场启动
                 task = getattr(message, "_pir_optimistic", None)
@@ -539,10 +551,12 @@ class ParallelImageReader(BasePlugin):
             # 3. 注入格式 hint（统一标识符格式说明）
             if self.load_mode == "llm_select":
                 hint = (
-                    "当消息中包含 [Image #xxxx: ] 格式的标记时，这表示用户发送了"
-                    "一张图片，其内容尚未加载。如需了解图片内容，请调用 "
-                    "describe_image 工具并传入标识符中的 xxxx。"
-                    "已加载的图片会显示为 [Image #xxxx: 描述内容]。"
+                    "当消息中包含 [Image #xxxx: (未识别)] 格式的标记时，"
+                    "这表示用户发送了一张图片，其内容尚未加载。如需了解图片"
+                    "内容，请调用 describe_image 工具并传入标识符中的 xxxx。"
+                    "已加载的图片会显示为 [Image #xxxx: 描述内容]，不可追溯的"
+                    "会显示为 [Image #xxxx: (已过期)]。"
+                    "注意：括号内为系统状态（未识别/已过期），不是图片内容。"
                 )
             else:
                 hint = (
@@ -596,9 +610,12 @@ class ParallelImageReader(BasePlugin):
 
     async def _fill_one_identifier(self, m: re.Match, event, session_key: str) -> str:
         short_id = m.group(1)
-        # [Image #id: ] 空内容；[Image #id: xxx] 有内容（跳过）
-        if m.group(0) != f"[Image #{short_id}: ]":
-            return m.group(0)
+        raw = m.group(0)
+        # 待填充态：空 或 (未识别)（系统状态标记，括号区分于图片内容）；
+        # 其他内容（描述 / (已过期)）跳过
+        if raw not in (f"[Image #{short_id}: ]",
+                       f"[Image #{short_id}: (未识别)]"):
+            return raw
 
         # 1. 缓存命中？
         full_md5 = self._id_map.get(short_id)
@@ -621,15 +638,15 @@ class ParallelImageReader(BasePlugin):
         if ele is not None:
             if self.load_mode == "llm_select":
                 # llm_select：当前回合原图可追溯（describe_image 工具可用），
-                # 保持空标识符，不得误标"已过期"
-                return m.group(0)
+                # 保持 (未识别) 状态标记，不得误标"已过期"
+                return raw
             desc = await self._describe_one(0, ele, session_key, 1)
             if desc:
                 return f"[Image #{short_id}: {desc}]"
-            return f"[Image #{short_id}: 已过期]"
+            return f"[Image #{short_id}: (已过期)]"
 
         # 3. 不可追溯
-        return f"[Image #{short_id}: 已过期]"
+        return f"[Image #{short_id}: (已过期)]"
 
     # ── 工具：describe_image（llm_select 模式）──
 

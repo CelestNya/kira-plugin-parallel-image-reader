@@ -1449,8 +1449,8 @@ async def _t48():
     # 零 VLM、零等待
     _check(vlm.call_count == 0, f"VLM called {vlm.call_count}, expected 0")
     _check(elapsed < 0.02, f"batch took {elapsed:.3f}s, expected ~0")
-    # 空标识符进历史（message_str 保持 [Image #id: ]）
-    _check(f"[Image #{md5[:8]}: ]" in batch_msg.message_str,
+    # (未识别) 系统状态标记进历史（括号区分于图片内容）
+    _check(f"[Image #{md5[:8]}: (未识别)]" in batch_msg.message_str,
            f"got: {batch_msg.message_str}")
     _check("<!--PIR" not in batch_msg.message_str, "placeholder leaked")
 
@@ -1964,15 +1964,15 @@ async def _t69():
     await plug.on_im_batch_message(batch_ev)  # llm_select 跳过，空标识符进历史
 
     # 当前回合消息进 user_prompt → ON_LLM_REQUEST 扫描：
-    # 原图可追溯（describe_image 可用）→ 必须保持空，不得误标"已过期"
+    # 原图可追溯（describe_image 可用）→ 必须保持 (未识别)，不得误标"已过期"
     # 注意：user_prompt 扫描用 isinstance(p, Prompt)，必须用真实 Prompt 实例
     mod, _ = load_plugin()
     req, tool_set = _mk_tool_req()
     fake_prompt = mod.Prompt(content=batch_msg.message_str, name="message")
     req.user_prompt.append(fake_prompt)
     await plug.on_llm_request(batch_ev, req)
-    _check(f"[Image #{md5[:8]}: ]" in fake_prompt.content,
-           f"should stay empty: {fake_prompt.content!r}")
+    _check(f"[Image #{md5[:8]}: (未识别)]" in fake_prompt.content,
+           f"should stay unidentified: {fake_prompt.content!r}")
     _check("已过期" not in fake_prompt.content,
            f"must not be marked expired: {fake_prompt.content!r}")
     _check(vlm.call_count == 0, f"llm_select must not VLM: {vlm.call_count}")
@@ -1993,7 +1993,7 @@ async def _t70():
     req.system_prompt.append(fake_prompt)
     batch_ev = FakeMessageBatchEvent([])
     await plug.on_llm_request(batch_ev, req)
-    _check("[Image #deadbeef: 已过期]" in hist_msg.content,
+    _check("[Image #deadbeef: (已过期)]" in hist_msg.content,
            f"history should be expired: {hist_msg.content!r}")
     _check(vlm.call_count == 0, f"must not VLM: {vlm.call_count}")
 
@@ -2013,15 +2013,17 @@ async def _t71():
     await plug.on_im_message(ev)  # noid_ 空标识符 + _pir_images 挂原图
     batch_msg = _make_batch_from_event(ev)
     batch_ev = FakeMessageBatchEvent([batch_msg])
+    await plug.on_im_batch_message(batch_ev)  # llm_select：改写为 (未识别)
 
     req, tool_set = _mk_tool_req()
     mod2, _ = load_plugin()
     fake_prompt = mod2.Prompt(content=batch_msg.message_str, name="message")
     req.user_prompt.append(fake_prompt)
     await plug.on_llm_request(batch_ev, req)
+    _check("[Image #noid_" in fake_prompt.content and "(未识别)" in fake_prompt.content,
+           f"noid_ should stay unidentified: {fake_prompt.content!r}")
     _check("已过期" not in fake_prompt.content,
-           f"noid_ should stay empty: {fake_prompt.content!r}")
-    _check(vlm.call_count == 0, f"must not VLM: {vlm.call_count}")
+           f"must not VLM: {vlm.call_count}")
 
 
 # ═══════════════════════════════════════════════════════════════

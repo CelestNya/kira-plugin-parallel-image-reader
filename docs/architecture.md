@@ -124,7 +124,8 @@ KiraAI 插件，作为 `data/plugins/parallel_image_reader` 目录加载（symli
 │
 ├─ 遍历 event.messages：
 │   ├─ _pir_images 空 → 跳过（无图/全缓存命中）
-│   ├─ load_mode == llm_select → 跳过（空标识符合法进历史，最终态）
+│   ├─ load_mode == llm_select → 空标识符改写为 (未识别) 系统状态标记
+│   │   进历史（不 VLM，LLM 可调 describe_image 加载）
 │   └─ 否则（lazy/eager）→ 加入 groups：
 │       ├─ 有 _pir_optimistic（eager 提前启动）→ groups.append((msg, images_map, task))
 │       └─ 无（lazy 现场）→ groups.append((msg, images_map, _describe_parallel(...)))
@@ -147,13 +148,13 @@ KiraAI 插件，作为 `data/plugins/parallel_image_reader` 目录加载（symli
 │
 ├─ 扫描 req.messages（历史）+ req.user_prompt（当前）中所有 [Image #id: ...]：
 │   │
-│   ├─ 内容非空（已有描述/已过期）→ 跳过
+│   ├─ 内容非空且非 (未识别)（描述/(已过期)）→ 跳过
 │   │
-│   ├─ 空内容 → id_map 反查 full_md5 → 查 image_desc_cache：
+│   ├─ 空内容 或 (未识别) → id_map 反查 full_md5 → 查 image_desc_cache：
 │   │   ├─ 缓存命中 → 替换为 [Image #id: 描述]
 │   │   ├─ 未命中 + 当前回合 _pir_images 有原图 + 非 llm_select → 触发 VLM 填充
-│   │   │   └─ VLM 成功 → [Image #id: 描述]；失败 → [Image #id: 已过期]
-│   │   └─ 未命中 + 不可追溯（无原图/无 id_map）→ [Image #id: 已过期]
+│   │   │   └─ VLM 成功 → [Image #id: 描述]；失败 → [Image #id: (已过期)]
+│   │   └─ 未命中 + 不可追溯（无原图/无 id_map）→ [Image #id: (已过期)]
 │   │
 │   └─ 注：llm_select 下当前回合未命中 → 保持空（LLM 可用工具自行加载）
 │
@@ -227,7 +228,7 @@ graph TD
     REQ --> SCAN["扫描 req.messages + user_prompt 标识符 ✅"]
     SCAN -->|"缓存命中"| FILL["[Image #id: 描述] ✅"]
     SCAN -->|"未命中 + 当前回合有原图 + lazy/eager"| VLM2["触发 VLM 填充 ✅<br/>换态场景"]
-    SCAN -->|"不可追溯"| EXPIRE["[Image #id: 已过期] ✅"]
+    SCAN -->|"不可追溯"| EXPIRE["[Image #id: (已过期)] ✅"]
 
     LLM["LLM 自主决定"] -->|"调 describe_image"| TOOL["describe_image(event, image_id) ✅"]
     TOOL -->|"当前回合 _pir_images"| TVLM["VLM → 描述 ✅"]
@@ -252,7 +253,7 @@ graph TD
 |----|----|
 | 格式 | `[Image #<short_id>: <内容>]`（**唯一形态**，三模式统一） |
 | short_id | md5 前 8 位（碰撞防御逐位加长，`_make_image_id`） |
-| 内容区 | 空（待填充）/ 描述 / 已过期（三态） |
+| 内容区 | 描述（图片内容）/ `(未识别)`（待加载）/ `(已过期)`（不可追溯）——括号=系统状态 |
 | 匹配正则 | `_IMAGE_RE = r"\[Image #([^\]\s:]+): [^\]]*\]"` |
 
 ### 消息对象自定义属性
