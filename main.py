@@ -148,7 +148,10 @@ class ParallelImageReader(BasePlugin):
         )
 
         # 转发展开层数上限（防恶意超深嵌套；深层内容无痕省略）
-        self.forward_max_depth = int(self.plugin_cfg.get("forward_max_depth", 64))
+        self.forward_max_depth = int(
+            self.plugin_cfg.get("forward_max_depth")
+            or ParallelImageReader._MAX_CHAIN_DEPTH
+        )
 
         self._sem = asyncio.Semaphore(self.max_concurrent)
         self._load_id_map()
@@ -246,21 +249,24 @@ class ParallelImageReader(BasePlugin):
         while i < len(chain):
             ele = chain[i]
             if isinstance(ele, Reply) and ele.chain is not None:
-                ParallelImageReader._flatten_forwards(
-                    ele.chain, stack, depth + 1, max_depth
-                )
-            elif isinstance(ele, Forward) and ele.chains:
-                # 先递归展开每个子链（内部嵌套全部处理）
-                for c in ele.chains:
+                if depth < max_depth:
                     ParallelImageReader._flatten_forwards(
-                        c, stack, depth + 1, max_depth
+                        ele.chain, stack, depth + 1, max_depth
                     )
+            elif isinstance(ele, Forward) and ele.chains:
+                # 先递归展开每个子链（内部嵌套全部处理）；深度守卫防
+                # 恶意超深嵌套 RecursionError（超限子树不展开，语义等价）
+                if depth < max_depth:
+                    for c in ele.chains:
+                        ParallelImageReader._flatten_forwards(
+                            c, stack, depth + 1, max_depth
+                        )
                 if depth > 0 and depth < max_depth:
                     # 嵌套 Forward：展开为其子链内容（平铺替换元素本身）
                     expanded = []
                     for c in ele.chains:
                         if id(c) in stack:
-                            break  # 环：保留 Forward 元素，核心过滤兜底
+                            continue  # 环：跳过该子链（内容无痕省略）
                         expanded.extend(c)
                     if expanded:
                         chain[i:i + 1] = expanded

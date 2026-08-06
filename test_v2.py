@@ -1901,13 +1901,23 @@ async def _t67():
     db = FakeDB()
     plug, mod = await _make_plugin(db, FakeVLM("desc"),
                                    {"load_mode": "lazy"})
-    # 迭代构造 1500 层嵌套（超过 Python 递归上限的 2 倍量级）
-    chain = FakeMessageChain([Image(md5="t67_md5_00000000000000000000000a")])
-    for _ in range(1500):
-        chain = FakeMessageChain([Forward(chains=[chain])])
-    ev = FakeMessageEvent(chain)
-    await plug.on_im_message(ev)  # 深度限制生效，不抛 RecursionError
-    _check(True, "deep nesting handled")
+    # 第 1 层（顶层 Forward 的子链）放图 + 1500 层深链：
+    # 浅层图必须被识别（阶段1 不得整体中止）
+    # 修复前：递归无守卫 → RecursionError 被吞 → 阶段1 中止 → 图全丢
+    md5 = "t67_md5_00000000000000000000000a"
+    deep = FakeMessageChain([Image(md5=md5)])
+    for _ in range(1499):
+        deep = FakeMessageChain([Forward(chains=[deep])])
+    top_chain = FakeMessageChain([Image(md5=md5), Forward(chains=[deep])])
+    ev = FakeMessageEvent(FakeMessageChain([Forward(chains=[top_chain])]))
+    await plug.on_im_message(ev)
+
+    # 顶层 Forward 保壳，第 1 层 Forward 展开 → 浅层图被替换为 Text
+    # （深层 64+ 保留 Forward 壳，无痕省略——安全降级而非整体中止）
+    top = ev.message.chain[0].chains[0]
+    top_types = [type(e).__name__ for e in top]
+    _check("Text" in top_types, f"shallow image should be identified: {top_types}")
+    _check("Image" not in top_types, f"shallow image not replaced: {top_types}")
 
 
 @_test("T68: forward_max_depth 配置生效（隔断层数）")
