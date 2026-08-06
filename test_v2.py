@@ -1833,6 +1833,83 @@ async def _t63():
     _check(len(plug._id_map) == 3, f"上限被突破: {len(plug._id_map)}")
 
 
+@_test("T64: 嵌套 Forward 图片被识别（拍平修复）")
+async def _t64():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("fwd desc"),
+                                   {"load_mode": "lazy"})
+    md5 = "t64_md5_00000000000000000000000a"
+    img = Image(md5=md5)
+    # 两层嵌套：外层 Forward → 中层（含 Forward）→ 内层含图
+    inner = FakeMessageChain([img, Text("深层")])
+    mid = FakeMessageChain([Text("中层"), Forward(chains=[inner])])
+    outer = FakeMessageChain([Forward(chains=[mid])])
+    ev = FakeMessageEvent(outer)
+    await plug.on_im_message(ev)
+
+    # 拍平后图片进 message_str（用户可观察行为）：内容不丢 + 标识符存在
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check("[Image #" in batch_msg.message_str and "深层" in batch_msg.message_str,
+           f"msg_str: {batch_msg.message_str!r}")
+
+
+@_test("T65: Forward 成环不崩溃（恶意输入）")
+async def _t65():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                   {"load_mode": "lazy"})
+    md5 = "t65_md5_00000000000000000000000a"
+    c1 = FakeMessageChain([Image(md5=md5), Text("环1")])
+    c2 = FakeMessageChain([Text("环2")])
+    c1.append(Forward(chains=[c2]))
+    c2.append(Forward(chains=[c1]))  # c1 → c2 → c1 成环
+    ev = FakeMessageEvent(FakeMessageChain([Forward(chains=[c1])]))
+    await plug.on_im_message(ev)  # 不崩溃、不无限递归即通过
+
+    # 环内至少一张图被识别进 message_str（核心过滤兜底安全降级）
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check("[Image #" in batch_msg.message_str,
+           f"msg_str: {batch_msg.message_str!r}")
+
+
+@_test("T66: Reply 内嵌套 Forward 图片被识别（审查补漏）")
+async def _t66():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                   {"load_mode": "lazy"})
+    md5 = "t66_md5_00000000000000000000000a"
+    # Reply.chain → Forward → 嵌套 Forward → 图片（issue 待办边界）
+    inner = FakeMessageChain([Image(md5=md5), Text("深层转发")])
+    fwd = Forward(chains=[FakeMessageChain([Text("层1"),
+                                            Forward(chains=[inner])])])
+    reply_chain = FakeMessageChain([Text("引用"), fwd])
+    outer = FakeMessageChain([Reply(chain=reply_chain)])
+    ev = FakeMessageEvent(outer)
+    await plug.on_im_message(ev)
+
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check("[Image #" in batch_msg.message_str
+           and "深层转发" in batch_msg.message_str,
+           f"msg_str: {batch_msg.message_str!r}")
+
+
+@_test("T67: 超深 Forward 嵌套插件不崩溃（恶意，审查补漏）")
+async def _t67():
+    db = FakeDB()
+    plug, mod = await _make_plugin(db, FakeVLM("desc"),
+                                   {"load_mode": "lazy"})
+    # 迭代构造 1500 层嵌套（超过 Python 递归上限的 2 倍量级）
+    chain = FakeMessageChain([Image(md5="t67_md5_00000000000000000000000a")])
+    for _ in range(1500):
+        chain = FakeMessageChain([Forward(chains=[chain])])
+    ev = FakeMessageEvent(chain)
+    await plug.on_im_message(ev)  # 深度限制生效，不抛 RecursionError
+    _check(True, "deep nesting handled")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -1867,6 +1944,10 @@ _TESTS = [
     _t62,
     # 审查修复：真实路径 FIFO（v2.4.0）
     _t63,
+    # Forward 嵌套/成环（issue #1）
+    _t64, _t65,
+    # 审查补漏：Reply 内 Forward / 超深嵌套（issue #1）
+    _t66, _t67,
 ]
 
 
