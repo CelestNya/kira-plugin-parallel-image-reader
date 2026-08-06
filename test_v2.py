@@ -1857,7 +1857,8 @@ async def _t63():
 async def _t64():
     db = FakeDB()
     plug, mod = await _make_plugin(db, FakeVLM("fwd desc"),
-                                   {"load_mode": "lazy"})
+                                   {"load_mode": "lazy",
+                                    "forward_max_depth": 64})
     md5 = "t64_md5_00000000000000000000000a"
     img = Image(md5=md5)
     # 两层嵌套：外层 Forward → 中层（含 Forward）→ 内层含图
@@ -1898,7 +1899,8 @@ async def _t65():
 async def _t66():
     db = FakeDB()
     plug, mod = await _make_plugin(db, FakeVLM("desc"),
-                                   {"load_mode": "lazy"})
+                                   {"load_mode": "lazy",
+                                    "forward_max_depth": 64})
     md5 = "t66_md5_00000000000000000000000a"
     # Reply.chain → Forward → 嵌套 Forward → 图片（issue 待办边界）
     inner = FakeMessageChain([Image(md5=md5), Text("深层转发")])
@@ -1963,11 +1965,17 @@ async def _t68():
     _check(types1 == ["Text", "Text", "Forward"],
            f"depth=2 should keep L3 shell: {types1}")
 
-    # 默认 64：三层全展开（Image 已被替换为 Text 标识符）
+    # 默认 1：只读第一层（跟从 KiraAI 原生）——L1 不展开，L2/L3 全保留壳
     plug2, types2 = await run_with({})
-    _check(plug2.forward_max_depth == 64, f"default depth: {plug2.forward_max_depth}")
-    _check(types2 == ["Text", "Text", "Text", "Text"],
-           f"default should expand all: {types2}")
+    _check(plug2.forward_max_depth == 1,
+           f"default depth should be 1 (native-aligned): {plug2.forward_max_depth}")
+    _check(types2 == ["Text", "Forward"],
+           f"default=1 should keep L2 shell: {types2}")
+
+    # 显式 64：三层全展开（Image 已被替换为 Text 标识符）
+    plug3, types3 = await run_with({"forward_max_depth": 64})
+    _check(types3 == ["Text", "Text", "Text", "Text"],
+           f"depth=64 should expand all: {types3}")
 
 
 @_test("T69: llm_select 当前回合空标识符不被误标已过期")
@@ -2185,6 +2193,19 @@ async def _t77():
     _check(f"[Image #{md5b[:8]}: (未识别)]" in b2.message_str,
            f"no reply: {b2.message_str!r}")
 
+    # 引用内容多图（grill 细化：仅引用单图时默认读取）→ (未识别)
+    md5c = "t77c_md5_" + "0" * 24
+    md5d = "t77d_md5_" + "0" * 24
+    reply_chain2 = FakeMessageChain([Image(md5=md5c), Image(md5=md5d)])
+    chain2 = FakeMessageChain([Reply(chain=reply_chain2)])
+    ev3 = FakeMessageEvent(chain2, group=object(), mentioned=False)
+    await plug.on_im_message(ev3)
+    b3 = _make_batch_from_event(ev3)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([b3]))
+    _check(f"[Image #{md5c[:8]}: (未识别)]" in b3.message_str
+           and f"[Image #{md5d[:8]}: (未识别)]" in b3.message_str,
+           f"reply multi-image should stay unidentified: {b3.message_str!r}")
+
 
 @_test("T78: 私聊多图 → 不自动读取（非单图）")
 async def _t78():
@@ -2200,6 +2221,45 @@ async def _t78():
     for m in md5s:
         _check(f"[Image #{m[:8]}: (未识别)]" in batch_msg.message_str,
                f"got: {batch_msg.message_str!r}")
+
+
+@_test("T79: 私聊批次多消息单图 → 自动读取；批次两图 → 不读")
+async def _t79():
+    db = FakeDB()
+    vlm = FakeVLM("批次描述")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t79_md5_00000000000000000000000a"
+
+    # 私聊批次：文字消息 + 图消息（flush 聚合）→ 批次 1 图 → 自动读取
+    ev_t = FakeMessageEvent([Text("文字消息")], group=None)
+    await plug.on_im_message(ev_t)
+    ev_i = FakeMessageEvent([Image(md5=md5)], group=None)
+    await plug.on_im_message(ev_i)
+    b_t = _make_batch_from_event(ev_t)
+    b_i = _make_batch_from_event(ev_i)
+    batch_ev = FakeMessageBatchEvent([b_t, b_i])
+    await plug.on_im_batch_message(batch_ev)
+    _check(vlm.call_count == 1, f"batch single image should VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: 批次描述]" in b_i.message_str,
+           f"got: {b_i.message_str!r}")
+
+    # 私聊批次：两条图消息（全新 md5，避免第一段缓存干扰）
+    # → 批次 2 图 → 不自动读取
+    md5b = "t79b_md5_" + "0" * 24
+    md5c = "t79c_md5_" + "0" * 24
+    plug2, mod2 = await _make_plugin(db, FakeVLM("d"),
+                                     {"load_mode": "llm_select"})
+    ev1 = FakeMessageEvent([Image(md5=md5b)], group=None)
+    await plug2.on_im_message(ev1)
+    ev2 = FakeMessageEvent([Image(md5=md5c)], group=None)
+    await plug2.on_im_message(ev2)
+    c1 = _make_batch_from_event(ev1)
+    c2 = _make_batch_from_event(ev2)
+    await plug2.on_im_batch_message(FakeMessageBatchEvent([c1, c2]))
+    _check(f"[Image #{md5b[:8]}: (未识别)]" in c1.message_str
+           and f"[Image #{md5c[:8]}: (未识别)]" in c2.message_str,
+           f"batch 2 images should stay unidentified: "
+           f"{c1.message_str!r} | {c2.message_str!r}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2250,6 +2310,8 @@ _TESTS = [
     _t72,
     # 自动读取矩阵（v2.4.5）：私聊单图/被@/引用 × 开关 × 多图
     _t73, _t74, _t75, _t76, _t77, _t78,
+    # grill 细化（v2.4.6）：私聊批次单图
+    _t79,
 ]
 
 

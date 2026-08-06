@@ -372,7 +372,7 @@ graph LR
 | `quality_enabled` | switch | false | JPEG 压缩后再送 VLM |
 | `quality_value` | integer | 85 | JPEG 压缩质量 (10-100) |
 | `id_map_limit` | integer | 1000 | id_map 上限（兼容旧 `llm_select_config` section 内位置，顶层优先） |
-| `forward_max_depth` | integer | 64 | 转发展开层数上限（嵌套 Forward 拍平深度，超限深层无痕省略） |
+| `forward_max_depth` | integer | 1 | 转发展开层数（默认 1=只读第一层，跟从原生；调大展开深层） |
 
 装配：`initialize()` 从 `plugin_cfg` 读取。旧配置兼容：`eager_loading=true` 且未设 `load_mode` → 迁移为 `eager`。
 

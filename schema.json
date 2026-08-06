@@ -2,7 +2,11 @@
     "load_mode": {
         "type": "enum",
         "name": "加载模式",
-        "options": ["lazy", "eager", "llm_select"],
+        "options": [
+            "lazy",
+            "eager",
+            "llm_select"
+        ],
         "default": "lazy",
         "hint": "图片描述加载方式：懒加载（触发时才识图，被忽略的消息零消耗）/ 乐观加载（收到即识图，延迟更低但消耗更多）/ LLM 选择性加载（LLM 按需调工具识图，最省 VLM）",
         "locales": {
@@ -18,7 +22,10 @@
         "default": 3,
         "hint": "最大并发 VLM 调用数",
         "locales": {
-            "zh": { "name": "最大并发数", "hint": "最大并发 VLM 调用数" }
+            "zh": {
+                "name": "最大并发数",
+                "hint": "最大并发 VLM 调用数"
+            }
         }
     },
     "quality_enabled": {
@@ -27,7 +34,10 @@
         "default": false,
         "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）",
         "locales": {
-            "zh": { "name": "JPEG 压缩", "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）" }
+            "zh": {
+                "name": "JPEG 压缩",
+                "hint": "启用 JPEG 压缩后再送 VLM（减小 payload，降低延迟）"
+            }
         }
     },
     "quality_value": {
@@ -36,7 +46,10 @@
         "default": 85,
         "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效",
         "locales": {
-            "zh": { "name": "压缩质量", "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效" }
+            "zh": {
+                "name": "压缩质量",
+                "hint": "JPEG 压缩质量 (10-100)，仅 quality_enabled 开启时生效"
+            }
         }
     },
     "id_map_limit": {
@@ -54,12 +67,12 @@
     "forward_max_depth": {
         "type": "integer",
         "name": "转发展开层数",
-        "default": 64,
-        "hint": "合并转发（Forward）嵌套展开的最大层数，超限的深层内容无痕省略（防恶意超深嵌套导致递归崩溃）",
+        "default": 1,
+        "hint": "合并转发（Forward）嵌套展开的最大层数。默认 1 = 只读第一层（与 KiraAI 原生行为一致）；调大展开深层嵌套（上游更新前建议保持默认）",
         "locales": {
             "zh": {
                 "name": "转发展开层数",
-                "hint": "合并转发（Forward）嵌套展开的最大层数，超限的深层内容无痕省略（防恶意超深嵌套导致递归崩溃）"
+                "hint": "合并转发（Forward）嵌套展开的最大层数。默认 1 = 只读第一层（与 KiraAI 原生行为一致）；调大展开深层嵌套（上游更新前建议保持默认）"
             }
         }
     },

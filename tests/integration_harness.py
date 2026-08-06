@@ -564,6 +564,7 @@ async def _test_forward_nested():
 
     h = Harness(load_mode="lazy")
     await h.start()
+    h.plugin.forward_max_depth = 64  # 场景测展开逻辑（默认 1=只读第一层）
     try:
         # 三层嵌套：外层 Forward → 中层 → 内层含图
         inner = MessageChain([Image(image=f"base64://{_PNG_B64}"), Text("深层转发")])
@@ -597,6 +598,7 @@ async def _test_forward_cycle():
 
     h = Harness(load_mode="lazy")
     await h.start()
+    h.plugin.forward_max_depth = 64  # 场景测展开逻辑（默认 1=只读第一层）
     try:
         c1 = MessageChain([Image(image=f"base64://{_PNG_B64}"), Text("环1")])
         c2 = MessageChain([Text("环2")])
@@ -622,6 +624,7 @@ async def _test_forward_reply():
 
     h = Harness(load_mode="lazy")
     await h.start()
+    h.plugin.forward_max_depth = 64  # 场景测展开逻辑（默认 1=只读第一层）
     try:
         inner = MessageChain([Image(image=f"base64://{_PNG_B64}"), Text("引用转发图")])
         fwd = Forward(chains=[MessageChain([Text("层1"), Forward(chains=[inner])])])

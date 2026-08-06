@@ -41,7 +41,7 @@ cp -r kira-plugin-parallel-image-reader /path/to/kiraai/data/plugins/parallel_im
 | `quality_enabled` | 开关 | 关 | 压缩后送识图，减少上传体积 |
 | `quality_value` | 整数 | 85 | 压缩质量 (10-100)，开启压缩时生效 |
 | `id_map_limit` | 整数 | 1000 | 标识符映射表上限（超限 FIFO 淘汰） |
-| `forward_max_depth` | 整数 | 64 | 转发展开层数上限（嵌套转发拍平深度，超限深层无痕省略） |
+| `forward_max_depth` | 整数 | 1 | 转发展开层数（默认 1=只读第一层，跟从 KiraAI 原生；调大展开深层） |
 
 ## 版本记录
 

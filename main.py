@@ -147,10 +147,10 @@ class ParallelImageReader(BasePlugin):
             self.plugin_cfg.get("id_map_limit") or llm_cfg.get("id_map_limit", 1000)
         )
 
-        # 转发展开层数上限（防恶意超深嵌套；深层内容无痕省略）
+        # 转发展开层数上限：默认 1（只读第一层，跟从 KiraAI 原生行为；
+        # 等待并向后兼容上游的 forward 读取更新，配置可调大展开深层）
         self.forward_max_depth = int(
-            self.plugin_cfg.get("forward_max_depth")
-            or ParallelImageReader._MAX_CHAIN_DEPTH
+            self.plugin_cfg.get("forward_max_depth") or 1
         )
 
         # llm_select 自动读取开关（schema auto_read_config section）：
@@ -428,6 +428,11 @@ class ParallelImageReader(BasePlugin):
         """
         session_key = event.session.sid if event.session else "default"
         try:
+            # 批次图片总数（llm_select 自动读取判定用：私聊批次单图）
+            batch_image_count = sum(
+                len(getattr(m, "_pir_images", None) or {})
+                for m in event.messages
+            )
             # 统一语义：收集所有消息的图片描述任务 → 跨消息并行 → 逐消息填充
             groups: list = []  # [(message, images_map, coro/task), ...]
             for message in event.messages:
@@ -437,7 +442,8 @@ class ParallelImageReader(BasePlugin):
                 # llm_select：满足自动读取条件 → 走 VLM 填充（同 lazy 路径）；
                 # 否则空标识符改写为 (未识别) 系统状态标记后进历史
                 if self.load_mode == "llm_select":
-                    if self._should_auto_read(message, event, images_map):
+                    if self._should_auto_read(
+                            message, event, images_map, batch_image_count):
                         groups.append((
                             message, images_map,
                             self._describe_parallel(
@@ -505,18 +511,21 @@ class ParallelImageReader(BasePlugin):
 
     # ── Chain 标识符替换（填充）──
 
-    def _should_auto_read(self, message, event, images_map: dict) -> bool:
-        """llm_select 自动读取判定：私聊单图 / 被@提及 / 引用含图消息。
+    def _should_auto_read(self, message, event, images_map: dict,
+                          batch_image_count: int) -> bool:
+        """llm_select 自动读取判定：私聊单图 / 被@提及 / 引用单图消息。
 
-        这些场景图片是明确给 bot 看的（无 LLM 决策空间），默认读取
-        提升体验；其余场景保持 (未识别) 由 LLM 决定。
+        细化规则（grill 后定稿）：
+        - 私聊：一批次消息内只含一张图时直接识别（不限单条消息）
+        - 被@：消息明确 @ 了 bot → 直接识别
+        - 引用：仅引用内容中只存在一张图时默认读取（多图由 LLM 决定）
+        其余场景保持 (未识别) 由 LLM 决定。
         """
-        # 私聊单图：私聊对话且整批只有一条消息且只有一张图
+        # 私聊单图：私聊对话且整批图片总数 == 1
         if self.private_single_auto_read:
             try:
                 if not event.is_group_message() \
-                        and len(event.messages) == 1 \
-                        and len(images_map) == 1:
+                        and batch_image_count == 1:
                     return True
             except Exception:
                 pass  # 事件缺属性（防御），退回常规判定
@@ -524,36 +533,55 @@ class ParallelImageReader(BasePlugin):
         if self.mention_reply_auto_read:
             if getattr(message, "is_mentioned", False):
                 return True
-            # 引用含图消息：Reply 内容里有图片标识符（阶段1 已替换）
-            if self._reply_chain_has_image(message.chain):
+            # 引用：仅引用内容（Reply.chain 内）只存在一张图时默认读取
+            if self._reply_image_count(message.chain) == 1:
                 return True
         return False
 
     @staticmethod
-    def _reply_chain_has_image(chain, visited=None) -> bool:
-        """消息链中是否存在引用（Reply）且其内容含图片标识符。
+    def _reply_image_count(chain, visited=None) -> int:
+        """消息链中所有引用（Reply）内容里的图片标识符总数。
 
+        只统计 Reply.chain 内部的图（引用内容），不含消息链直接元素。
         注意不能依赖 _walk：_walk 只 yield Image/Sticker，不 yield Reply
-        元素本身（递归进入其 chain）——需直接遍历查找 Reply。
+        元素本身——需直接遍历查找 Reply。
         """
         if visited is None:
             visited = set()
         cid = id(chain)
         if cid in visited:
-            return False
+            return 0
         visited.add(cid)
+        count = 0
         for ele in chain:
             if isinstance(ele, Reply) and ele.chain is not None:
-                for sub in ele.chain:
-                    if isinstance(sub, Text) and "[Image #" in sub.text:
-                        return True
-                if ParallelImageReader._reply_chain_has_image(ele.chain, visited):
-                    return True
+                count += ParallelImageReader._count_images_in(
+                    ele.chain, visited
+                )
             elif isinstance(ele, Forward) and ele.chains:
                 for c in ele.chains:
-                    if ParallelImageReader._reply_chain_has_image(c, visited):
-                        return True
-        return False
+                    count += ParallelImageReader._reply_image_count(c, visited)
+        return count
+
+    @staticmethod
+    def _count_images_in(chain, visited=None) -> int:
+        """统计 chain 内图片标识符数量（递归含嵌套层，阶段1 已替换为 Text）。"""
+        if visited is None:
+            visited = set()
+        cid = id(chain)
+        if cid in visited:
+            return 0
+        visited.add(cid)
+        count = 0
+        for ele in chain:
+            if isinstance(ele, Text) and "[Image #" in ele.text:
+                count += 1
+            elif isinstance(ele, Reply) and ele.chain is not None:
+                count += ParallelImageReader._count_images_in(ele.chain, visited)
+            elif isinstance(ele, Forward) and ele.chains:
+                for c in ele.chains:
+                    count += ParallelImageReader._count_images_in(c, visited)
+        return count
 
     @staticmethod
     def _replace_in_chain(chain, fill_map: dict, visited=None, depth=0, max_depth=None):
