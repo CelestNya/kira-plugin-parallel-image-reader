@@ -424,8 +424,20 @@ class ParallelImageReader(BasePlugin):
                 images_map = getattr(message, "_pir_images", None)
                 if not images_map:
                     continue  # 无图或全缓存命中
-                # llm_select：空标识符合法进历史（最终态），不 VLM
+                # llm_select：空标识符改写为 (未识别) 系统状态标记后进历史，
+                # 不 VLM（LLM 可分辨状态并调 describe_image 工具加载）
                 if self.load_mode == "llm_select":
+                    mark_map = {
+                        f"[Image #{short_id}: ]": f"[Image #{short_id}: (未识别)]"
+                        for short_id in images_map
+                    }
+                    if message.message_str:
+                        for old, new in mark_map.items():
+                            message.message_str = message.message_str.replace(old, new)
+                    self._replace_in_chain(
+                        message.chain, mark_map,
+                        max_depth=self.forward_max_depth,
+                    )
                     continue
                 # eager 复用阶段1 提前启动的 task；lazy 现场启动
                 task = getattr(message, "_pir_optimistic", None)
@@ -511,8 +523,9 @@ class ParallelImageReader(BasePlugin):
         - llm_select 模式：describe_image 常驻——有图/无图消息工具集一致，
           避免工具前缀抖动破坏 LLM 上下文缓存（缓存按请求前缀精确匹配）
         - 所有模式：扫描 req.messages + user_prompt 中的 [Image #id: ] 空标识符：
-          缓存命中 → 填描述；未命中且可追溯（当前回合有原图）且 lazy/eager →
-          触发 VLM；不可追溯 → "已过期"
+          缓存命中 → 填描述；未命中且可追溯（当前回合有原图）→ lazy/eager
+          触发 VLM，llm_select 保持空（LLM 可调 describe_image 加载）；
+          不可追溯 → "已过期"
         """
         try:
             # 1. 换态工具增删（模仿 file 插件 filter_tools 模式）
@@ -538,10 +551,12 @@ class ParallelImageReader(BasePlugin):
             # 3. 注入格式 hint（统一标识符格式说明）
             if self.load_mode == "llm_select":
                 hint = (
-                    "当消息中包含 [Image #xxxx: ] 格式的标记时，这表示用户发送了"
-                    "一张图片，其内容尚未加载。如需了解图片内容，请调用 "
-                    "describe_image 工具并传入标识符中的 xxxx。"
-                    "已加载的图片会显示为 [Image #xxxx: 描述内容]。"
+                    "当消息中包含 [Image #xxxx: (未识别)] 格式的标记时，"
+                    "这表示用户发送了一张图片，其内容尚未加载。如需了解图片"
+                    "内容，请调用 describe_image 工具并传入标识符中的 xxxx。"
+                    "已加载的图片会显示为 [Image #xxxx: 描述内容]，不可追溯的"
+                    "会显示为 [Image #xxxx: (已过期)]。"
+                    "注意：括号内为系统状态（未识别/已过期），不是图片内容。"
                 )
             else:
                 hint = (
@@ -579,7 +594,8 @@ class ParallelImageReader(BasePlugin):
         规则：
         - 内容非空（已有描述/已过期）→ 跳过
         - 空内容 + 缓存命中 → 填描述
-        - 空内容 + 未命中 + 当前回合有原图（_pir_images）→ 触发 VLM（lazy/eager 换态）
+        - 空内容 + 未命中 + 当前回合有原图（_pir_images）：
+          lazy/eager → 触发 VLM 填充；llm_select → 保持空（工具可加载）
         - 空内容 + 不可追溯 → "已过期"
         """
         # re.sub 无法 await，手写异步替换循环
@@ -594,9 +610,12 @@ class ParallelImageReader(BasePlugin):
 
     async def _fill_one_identifier(self, m: re.Match, event, session_key: str) -> str:
         short_id = m.group(1)
-        # [Image #id: ] 空内容；[Image #id: xxx] 有内容（跳过）
-        if m.group(0) != f"[Image #{short_id}: ]":
-            return m.group(0)
+        raw = m.group(0)
+        # 待填充态：空 或 (未识别)（系统状态标记，括号区分于图片内容）；
+        # 其他内容（描述 / (已过期)）跳过
+        if raw not in (f"[Image #{short_id}: ]",
+                       f"[Image #{short_id}: (未识别)]"):
+            return raw
 
         # 1. 缓存命中？
         full_md5 = self._id_map.get(short_id)
@@ -616,14 +635,18 @@ class ParallelImageReader(BasePlugin):
             if images_map and short_id in images_map:
                 ele = images_map[short_id]
                 break
-        if ele is not None and self.load_mode != "llm_select":
+        if ele is not None:
+            if self.load_mode == "llm_select":
+                # llm_select：当前回合原图可追溯（describe_image 工具可用），
+                # 保持 (未识别) 状态标记，不得误标"已过期"
+                return raw
             desc = await self._describe_one(0, ele, session_key, 1)
             if desc:
                 return f"[Image #{short_id}: {desc}]"
-            return f"[Image #{short_id}: 已过期]"
+            return f"[Image #{short_id}: (已过期)]"
 
         # 3. 不可追溯
-        return f"[Image #{short_id}: 已过期]"
+        return f"[Image #{short_id}: (已过期)]"
 
     # ── 工具：describe_image（llm_select 模式）──
 

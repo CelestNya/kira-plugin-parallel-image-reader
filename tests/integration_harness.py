@@ -412,9 +412,10 @@ async def _test_llm_select_full_pipeline():
         assert h.vlm.call_count == 0, f"stage2 should not VLM: {h.vlm.call_count}"
         batch = await h.run_batch()
         msg = batch.messages[0]
-        # 阶段2 后（LLM 请求前）：空标识符保留
-        assert f"[Image #{image_id}: ]" in msg.message_str, f"empty kept: {msg.message_str!r}"
-        print("  [OK] llm_select 阶段2：零 VLM，空标识符进 message_str")
+        # 阶段2 后（LLM 请求前）：(未识别) 系统状态标记保留
+        assert f"[Image #{image_id}: (未识别)]" in msg.message_str, \
+            f"unidentified kept: {msg.message_str!r}"
+        print("  [OK] llm_select 阶段2：零 VLM，(未识别) 进 message_str")
 
         # LLM 请求：工具调用 → describe_image → VLM → tool 消息
         # （AgentExecutor 执行工具，vlm 被调用一次）
@@ -465,7 +466,7 @@ async def _test_switch_matrix():
         assert "集成测试图片描述" in batch1.messages[0].message_str, \
             f"lazy fill: {batch1.messages[0].message_str!r}"
 
-        # 2. 运行时切 llm_select → 空标识符进历史，不 VLM
+        # 2. 运行时切 llm_select → (未识别) 系统状态进历史，不 VLM
         h.plugin.load_mode = "llm_select"
         vlm_before = h.vlm.call_count
         ev2 = h.make_image_event(message_id="sw2",
@@ -473,8 +474,9 @@ async def _test_switch_matrix():
         await h.run_im(ev2)
         batch2 = await h.run_batch()
         import re
-        assert re.search(r"\[Image #[0-9a-f]+: \]", batch2.messages[0].message_str), \
-            f"llm_select empty: {batch2.messages[0].message_str!r}"
+        assert re.search(r"\[Image #[0-9a-f]+: \(未识别\)\]",
+                         batch2.messages[0].message_str), \
+            f"llm_select unidentified: {batch2.messages[0].message_str!r}"
         assert h.vlm.call_count == vlm_before, "llm_select should not VLM in stage2"
         print("  [OK] 换态矩阵：lazy→llm_select 行为切换正确")
 
