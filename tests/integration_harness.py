@@ -613,6 +613,30 @@ async def _test_forward_cycle():
         await h.stop()
 
 
+async def _test_forward_reply():
+    """Reply 内 Forward：引用消息里的转发图片同样识别（issue #1 边界）。"""
+    from core.chat.message_elements import Forward, Text, Image, Reply
+    from core.chat.message_utils import MessageChain
+
+    h = Harness(load_mode="lazy")
+    await h.start()
+    try:
+        inner = MessageChain([Image(image=f"base64://{_PNG_B64}"), Text("引用转发图")])
+        fwd = Forward(chains=[MessageChain([Text("层1"), Forward(chains=[inner])])])
+        outer = MessageChain([Reply(message_id="r9", chain=MessageChain([fwd]))])
+        ev = h.make_image_event(chain=outer, message_id="fwd-reply")
+        await h.run_im(ev)
+
+        batch = await h.run_batch()
+        assert batch is not None, "batch not produced"
+        msg_str = batch.messages[0].message_str
+        assert "[Image #" in msg_str, f"reply fwd identifier missing: {msg_str!r}"
+        assert "引用转发图" in msg_str, f"reply fwd content lost: {msg_str!r}"
+        print("  [OK] Reply 内 Forward：图片识别，内容完整")
+    finally:
+        await h.stop()
+
+
 async def main():
     print("\nKiraAI 集成测试 harness（真实核心管线 + 真实插件）\n")
     tests = [
@@ -624,6 +648,7 @@ async def main():
         ("压测：缓存命中", _test_stress_cache_hit),
         ("Forward 嵌套", _test_forward_nested),
         ("Forward 成环", _test_forward_cycle),
+        ("Reply 内 Forward", _test_forward_reply),
     ]
     passed = 0
     for name, fn in tests:
