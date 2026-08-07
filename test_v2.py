@@ -72,7 +72,10 @@ class Text:
 
 
 class Reply:
-    def __init__(self, chain=None):
+    """对齐真实 KiraAI Reply（message_id 必须存在——stub 缺属性会让
+    插件新代码 AttributeError 被吞，测试假绿）。"""
+    def __init__(self, chain=None, message_id="r1"):
+        self.message_id = str(message_id)
         self.chain = chain
 
 
@@ -173,11 +176,14 @@ class FakeMessageChain(list):
 
 class FakeMessage:
     """模拟 KiraIMMessage — 有 chain 和 message_str，可挂自定义属性。"""
-    def __init__(self, chain, message_str=None):
+    def __init__(self, chain, message_str=None, is_mentioned=False, group=None):
         self.chain = FakeMessageChain(chain)
         # _pir_images / _pir_optimistic 默认 None（模拟本体行为，插件会设置它）
         self._pir_images = None
         self._pir_optimistic = None
+        # 环境属性（测试质量反思：此前缺这些导致私聊/提及场景从未被覆盖）
+        self.is_mentioned = is_mentioned
+        self.group = group
         # message_str 模拟本体 message_format_to_text 的输出
         if message_str is not None:
             self.message_str = message_str
@@ -240,18 +246,24 @@ class FakeSession:
 
 class FakeMessageEvent:
     """Mimics KiraMessageEvent — minimal fields plugin touches."""
-    def __init__(self, chain, sid: str = "test_session"):
+    def __init__(self, chain, sid: str = "test_session",
+                 mentioned: bool = False, group: Optional[object] = None):
         self.session = FakeSession(sid)
-        self.message = FakeMessage(chain, message_str="")
+        # group 非空 = 群聊；None = 私聊（对齐本体 is_group_message 判定）
+        self.message = FakeMessage(chain, message_str="",
+                                   is_mentioned=mentioned, group=group)
 
 
 class FakeBatchMessage:
     """模拟 batch 中的单条消息。chain 是已经过阶段1处理的（Image→Text空标识符）。"""
     def __init__(self, chain, message_str=None,
-                 _pir_optimistic=None, _pir_images=None):
+                 _pir_optimistic=None, _pir_images=None,
+                 is_mentioned=False, group=None):
         self.chain = FakeMessageChain(chain)
         self._pir_optimistic = _pir_optimistic
         self._pir_images = _pir_images
+        self.is_mentioned = is_mentioned
+        self.group = group
         self.message_str = message_str if message_str is not None else _simulate_format_to_text(chain)
 
 
@@ -260,6 +272,12 @@ class FakeMessageBatchEvent:
     def __init__(self, messages, sid: str = "test_session"):
         self.session = FakeSession(sid)
         self.messages = messages if isinstance(messages, list) else [messages]
+
+    def is_group_message(self) -> bool:
+        """对齐本体：batch 最后一条消息的 group 非空 = 群聊。"""
+        if not self.messages:
+            return False
+        return getattr(self.messages[-1], "group", None) is not None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -413,6 +431,10 @@ def _make_batch_from_event(ev: FakeMessageEvent) -> FakeBatchMessage:
         message_str=msg.message_str,
         _pir_images=getattr(msg, "_pir_images", None),
         _pir_optimistic=getattr(msg, "_pir_optimistic", None),
+        # 环境属性必须随消息传递（本体 batch 复用同一 message 实例）：
+        # 缺失会导致 is_group_message 误判私聊 → 自动读取误触发
+        is_mentioned=getattr(msg, "is_mentioned", False),
+        group=getattr(msg, "group", None),
     )
 
 
@@ -1437,7 +1459,8 @@ async def _t48():
     plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
     md5 = "t48_md5_00000000000000000000000a"
     img = Image(md5=md5)
-    ev = FakeMessageEvent([img])
+    # 群聊未提及（避免私聊单图/被@自动读取干扰本测试意图）
+    ev = FakeMessageEvent([img], group=object(), mentioned=False)
     await plug.on_im_message(ev)
 
     batch_msg = _make_batch_from_event(ev)
@@ -1705,10 +1728,10 @@ async def _t59():
     _check(f"[Image #{md5a[:8]}: mode desc]" in batch_a.message_str,
            f"lazy batch: {batch_a.message_str}")
 
-    # 2. 运行时切 llm_select：空标识符 + 不 VLM
+    # 2. 运行时切 llm_select：空标识符 + 不 VLM（群聊，避免私聊自动读取）
     plug.load_mode = "llm_select"
     md5b = "t59_b_" + "0" * 24
-    evb = FakeMessageEvent([Image(md5=md5b)])
+    evb = FakeMessageEvent([Image(md5=md5b)], group=object())
     await plug.on_im_message(evb)
     _check(f"[Image #{md5b[:8]}: ]" == evb.message.chain[0].text,
            f"llm_select: {evb.message.chain[0].text!r}")
@@ -1837,7 +1860,8 @@ async def _t63():
 async def _t64():
     db = FakeDB()
     plug, mod = await _make_plugin(db, FakeVLM("fwd desc"),
-                                   {"load_mode": "lazy"})
+                                   {"load_mode": "lazy",
+                                    "forward_max_depth": 64})
     md5 = "t64_md5_00000000000000000000000a"
     img = Image(md5=md5)
     # 两层嵌套：外层 Forward → 中层（含 Forward）→ 内层含图
@@ -1878,7 +1902,8 @@ async def _t65():
 async def _t66():
     db = FakeDB()
     plug, mod = await _make_plugin(db, FakeVLM("desc"),
-                                   {"load_mode": "lazy"})
+                                   {"load_mode": "lazy",
+                                    "forward_max_depth": 64})
     md5 = "t66_md5_00000000000000000000000a"
     # Reply.chain → Forward → 嵌套 Forward → 图片（issue 待办边界）
     inner = FakeMessageChain([Image(md5=md5), Text("深层转发")])
@@ -1943,11 +1968,17 @@ async def _t68():
     _check(types1 == ["Text", "Text", "Forward"],
            f"depth=2 should keep L3 shell: {types1}")
 
-    # 默认 64：三层全展开（Image 已被替换为 Text 标识符）
+    # 默认 1：只读第一层（跟从 KiraAI 原生）——L1 不展开，L2/L3 全保留壳
     plug2, types2 = await run_with({})
-    _check(plug2.forward_max_depth == 64, f"default depth: {plug2.forward_max_depth}")
-    _check(types2 == ["Text", "Text", "Text", "Text"],
-           f"default should expand all: {types2}")
+    _check(plug2.forward_max_depth == 1,
+           f"default depth should be 1 (native-aligned): {plug2.forward_max_depth}")
+    _check(types2 == ["Text", "Forward"],
+           f"default=1 should keep L2 shell: {types2}")
+
+    # 显式 64：三层全展开（Image 已被替换为 Text 标识符）
+    plug3, types3 = await run_with({"forward_max_depth": 64})
+    _check(types3 == ["Text", "Text", "Text", "Text"],
+           f"depth=64 should expand all: {types3}")
 
 
 @_test("T69: llm_select 当前回合空标识符不被误标已过期")
@@ -1956,12 +1987,13 @@ async def _t69():
     vlm = FakeVLM("desc")
     plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
     md5 = "t69_md5_00000000000000000000000a"
+    # 群聊（避免私聊单图自动读取干扰本测试意图）
     img = Image(md5=md5)
-    ev = FakeMessageEvent([img])
+    ev = FakeMessageEvent([img], group=object())
     await plug.on_im_message(ev)              # 空标识符 + _pir_images 挂原图
     batch_msg = _make_batch_from_event(ev)
     batch_ev = FakeMessageBatchEvent([batch_msg])
-    await plug.on_im_batch_message(batch_ev)  # llm_select 跳过，空标识符进历史
+    await plug.on_im_batch_message(batch_ev)  # llm_select：改写为 (未识别)
 
     # 当前回合消息进 user_prompt → ON_LLM_REQUEST 扫描：
     # 原图可追溯（describe_image 可用）→ 必须保持 (未识别)，不得误标"已过期"
@@ -2009,7 +2041,8 @@ async def _t71():
             raise RuntimeError("chaos hash")
 
     img = _BrokenImage(md5="t71_md5_00000000000000000000000a")
-    ev = FakeMessageEvent([img])
+    # 群聊（避免私聊单图自动读取干扰本测试意图）
+    ev = FakeMessageEvent([img], group=object())
     await plug.on_im_message(ev)  # noid_ 空标识符 + _pir_images 挂原图
     batch_msg = _make_batch_from_event(ev)
     batch_ev = FakeMessageBatchEvent([batch_msg])
@@ -2060,6 +2093,178 @@ async def _t72():
            "blank arg")
 
 
+@_test("T73: 私聊单图 + 默认开关 → 阶段2 自动 VLM 填充")
+async def _t73():
+    db = FakeDB()
+    vlm = FakeVLM("私聊描述")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    _check(plug.private_single_auto_read, "default on")
+    md5 = "t73_md5_00000000000000000000000a"
+    ev = FakeMessageEvent([Image(md5=md5)], group=None)  # 私聊
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(vlm.call_count == 1, f"VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: 私聊描述]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+    _check("(未识别)" not in batch_msg.message_str, "should not be unidentified")
+
+
+@_test("T74: 私聊单图 + 开关关 → (未识别) 零 VLM")
+async def _t74():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select",
+                                             "auto_read_config": {
+                                                 "private_single_auto_read": False}})
+    _check(not plug.private_single_auto_read, "switch off")
+    md5 = "t74_md5_00000000000000000000000a"
+    ev = FakeMessageEvent([Image(md5=md5)], group=None)  # 私聊
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(vlm.call_count == 0, f"VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: (未识别)]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+
+
+@_test("T75: 群聊单图（未@）→ (未识别) 不误读")
+async def _t75():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t75_md5_00000000000000000000000a"
+    ev = FakeMessageEvent([Image(md5=md5)], group=object(), mentioned=False)
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(vlm.call_count == 0, f"VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: (未识别)]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+
+
+@_test("T76: 被@提及 → 自动 VLM；群聊未@ → (未识别)")
+async def _t76():
+    db = FakeDB()
+    vlm = FakeVLM("提及描述")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t76_md5_00000000000000000000000a"
+    # 被@：群聊 + mentioned=True → 自动读取
+    ev = FakeMessageEvent([Image(md5=md5)], group=object(), mentioned=True)
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(vlm.call_count == 1, f"VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: 提及描述]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+    # 开关关 → (未识别)（用无缓存的新图，避免段1 缓存命中干扰）
+    plug2, mod2 = await _make_plugin(db, FakeVLM("d"),
+                                     {"load_mode": "llm_select",
+                                      "auto_read_config": {
+                                          "mention_reply_auto_read": False}})
+    md5b = "t76b_md5_" + "0" * 24
+    ev2 = FakeMessageEvent([Image(md5=md5b)], group=object(), mentioned=True)
+    await plug2.on_im_message(ev2)
+    b2 = _make_batch_from_event(ev2)
+    await plug2.on_im_batch_message(FakeMessageBatchEvent([b2]))
+    _check(f"[Image #{md5b[:8]}: (未识别)]" in b2.message_str,
+           f"switch off: {b2.message_str!r}")
+
+
+@_test("T77: 引用（Reply）含图消息 → 自动 VLM")
+async def _t77():
+    db = FakeDB()
+    vlm = FakeVLM("引用描述")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t77_md5_00000000000000000000000a"
+    # 消息含 Reply（引用），Reply.chain 里有图 → 自动读取
+    reply_chain = FakeMessageChain([Image(md5=md5), Text("被引用的图")])
+    chain = FakeMessageChain([Text("引用了一条消息"), Reply(chain=reply_chain)])
+    ev = FakeMessageEvent(chain, group=object(), mentioned=False)
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(vlm.call_count == 1, f"VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: 引用描述]" in batch_msg.message_str,
+           f"got: {batch_msg.message_str!r}")
+    # 无引用的普通消息 → (未识别)（用无缓存的新图）
+    md5b = "t77b_md5_" + "0" * 24
+    ev2 = FakeMessageEvent([Image(md5=md5b)], group=object(), mentioned=False)
+    await plug.on_im_message(ev2)
+    b2 = _make_batch_from_event(ev2)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([b2]))
+    _check(f"[Image #{md5b[:8]}: (未识别)]" in b2.message_str,
+           f"no reply: {b2.message_str!r}")
+
+    # 引用内容多图（grill 细化：仅引用单图时默认读取）→ (未识别)
+    md5c = "t77c_md5_" + "0" * 24
+    md5d = "t77d_md5_" + "0" * 24
+    reply_chain2 = FakeMessageChain([Image(md5=md5c), Image(md5=md5d)])
+    chain2 = FakeMessageChain([Reply(chain=reply_chain2)])
+    ev3 = FakeMessageEvent(chain2, group=object(), mentioned=False)
+    await plug.on_im_message(ev3)
+    b3 = _make_batch_from_event(ev3)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([b3]))
+    _check(f"[Image #{md5c[:8]}: (未识别)]" in b3.message_str
+           and f"[Image #{md5d[:8]}: (未识别)]" in b3.message_str,
+           f"reply multi-image should stay unidentified: {b3.message_str!r}")
+
+
+@_test("T78: 私聊多图 → 不自动读取（非单图）")
+async def _t78():
+    db = FakeDB()
+    vlm = FakeVLM("desc")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5s = [f"t78_{i}_" + "0" * 24 for i in range(2)]
+    ev = FakeMessageEvent([Image(md5=m) for m in md5s], group=None)  # 私聊但 2 图
+    await plug.on_im_message(ev)
+    batch_msg = _make_batch_from_event(ev)
+    await plug.on_im_batch_message(FakeMessageBatchEvent([batch_msg]))
+    _check(vlm.call_count == 0, f"VLM: {vlm.call_count}")
+    for m in md5s:
+        _check(f"[Image #{m[:8]}: (未识别)]" in batch_msg.message_str,
+               f"got: {batch_msg.message_str!r}")
+
+
+@_test("T79: 私聊批次多消息单图 → 自动读取；批次两图 → 不读")
+async def _t79():
+    db = FakeDB()
+    vlm = FakeVLM("批次描述")
+    plug, mod = await _make_plugin(db, vlm, {"load_mode": "llm_select"})
+    md5 = "t79_md5_00000000000000000000000a"
+
+    # 私聊批次：文字消息 + 图消息（flush 聚合）→ 批次 1 图 → 自动读取
+    ev_t = FakeMessageEvent([Text("文字消息")], group=None)
+    await plug.on_im_message(ev_t)
+    ev_i = FakeMessageEvent([Image(md5=md5)], group=None)
+    await plug.on_im_message(ev_i)
+    b_t = _make_batch_from_event(ev_t)
+    b_i = _make_batch_from_event(ev_i)
+    batch_ev = FakeMessageBatchEvent([b_t, b_i])
+    await plug.on_im_batch_message(batch_ev)
+    _check(vlm.call_count == 1, f"batch single image should VLM: {vlm.call_count}")
+    _check(f"[Image #{md5[:8]}: 批次描述]" in b_i.message_str,
+           f"got: {b_i.message_str!r}")
+
+    # 私聊批次：两条图消息（全新 md5，避免第一段缓存干扰）
+    # → 批次 2 图 → 不自动读取
+    md5b = "t79b_md5_" + "0" * 24
+    md5c = "t79c_md5_" + "0" * 24
+    plug2, mod2 = await _make_plugin(db, FakeVLM("d"),
+                                     {"load_mode": "llm_select"})
+    ev1 = FakeMessageEvent([Image(md5=md5b)], group=None)
+    await plug2.on_im_message(ev1)
+    ev2 = FakeMessageEvent([Image(md5=md5c)], group=None)
+    await plug2.on_im_message(ev2)
+    c1 = _make_batch_from_event(ev1)
+    c2 = _make_batch_from_event(ev2)
+    await plug2.on_im_batch_message(FakeMessageBatchEvent([c1, c2]))
+    _check(f"[Image #{md5b[:8]}: (未识别)]" in c1.message_str
+           and f"[Image #{md5c[:8]}: (未识别)]" in c2.message_str,
+           f"batch 2 images should stay unidentified: "
+           f"{c1.message_str!r} | {c2.message_str!r}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════
@@ -2106,6 +2311,10 @@ _TESTS = [
     _t70, _t71,
     # 工具批量调用（v2.4.4）
     _t72,
+    # 自动读取矩阵（v2.4.5）：私聊单图/被@/引用 × 开关 × 多图
+    _t73, _t74, _t75, _t76, _t77, _t78,
+    # grill 细化（v2.4.6）：私聊批次单图
+    _t79,
 ]
 
 

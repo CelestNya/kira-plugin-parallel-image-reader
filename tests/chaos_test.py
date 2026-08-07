@@ -166,18 +166,21 @@ def _flatten_imgs(chain, visited=None):
     return imgs
 
 
-def _random_chain(rng, elements, depth=0):
-    """按随机结构组装链：Text 混排 + Reply/Forward 嵌套（含成环）。"""
+def _random_chain(rng, elements, depth=0, allow_reply=True):
+    """按随机结构组装链：Text 混排 + Reply/Forward 嵌套（含成环）。
+
+    allow_reply=False：纯净轮用（排除引用图自动读取对 VLM 计数断言的干扰）。
+    """
     chain = tv.FakeMessageChain()
     for ele in elements:
         r = rng.random()
-        if depth < 2 and r < 0.12:
-            inner = _random_chain(rng, [ele], depth + 1)
+        if allow_reply and depth < 2 and r < 0.12:
+            inner = _random_chain(rng, [ele], depth + 1, allow_reply)
             chain.append(tv.Reply(inner))
         elif depth < 2 and r < 0.20:
             chain.append(tv.Forward([
-                _random_chain(rng, [ele], depth + 1),
-                _random_chain(rng, [], depth + 1),
+                _random_chain(rng, [ele], depth + 1, allow_reply),
+                _random_chain(rng, [], depth + 1, allow_reply),
             ]))
         elif r < 0.25 and isinstance(ele, tv.Image):
             chain.append(tv.Text("伴随文字"))
@@ -283,10 +286,10 @@ async def chaos_round(rng, rnd):
             elements.append(tv.Text("纯文本消息"))
         if elements and rng.random() < 0.3:
             elements.insert(0, tv.Text("开头文字"))
-        if rng.random() < 0.1:
+        if not pure and rng.random() < 0.1:
             chain = _make_cycle_chain(elements[0] if elements else tv.Text("x"))
         else:
-            chain = _random_chain(rng, elements)
+            chain = _random_chain(rng, elements, allow_reply=not pure)
 
         # 阶段1 未命中图数（纯净轮用于精确断言；此步必须先于 on_im_message）
         # 按 md5 去重：同一 chain 内重复 md5 共享 short_id，_pir_images 合并为一个键
@@ -303,7 +306,15 @@ async def chaos_round(rng, rnd):
                     except Exception:
                         pass
 
-        ev = tv.FakeMessageEvent(chain)
+        # 环境属性（测试质量反思：事件维度进入混沌矩阵）：
+        # 纯净轮固定群聊+未提及（VLM 计数可精确断言）；
+        # 故障轮随机私聊/群聊/提及（覆盖自动读取判定路径）
+        if pure:
+            group, mentioned = object(), False
+        else:
+            group = object() if rng.random() < 0.6 else None
+            mentioned = rng.random() < 0.5
+        ev = tv.FakeMessageEvent(chain, group=group, mentioned=mentioned)
         try:
             await asyncio.wait_for(plug.on_im_message(ev), ROUND_TIMEOUT)
         except Exception as e:

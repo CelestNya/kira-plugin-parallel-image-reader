@@ -124,8 +124,9 @@ KiraAI 插件，作为 `data/plugins/parallel_image_reader` 目录加载（symli
 │
 ├─ 遍历 event.messages：
 │   ├─ _pir_images 空 → 跳过（无图/全缓存命中）
-│   ├─ load_mode == llm_select → 空标识符改写为 (未识别) 系统状态标记
-│   │   进历史（不 VLM，LLM 可调 describe_image 加载）
+│   ├─ load_mode == llm_select → 满足自动读取（私聊单图/被@/引用含图消息，
+│   │   开关 auto_read_config）→ 走 VLM 填充（同 lazy）；否则空标识符改写为
+│   │   (未识别) 系统状态标记进历史（不 VLM，LLM 可调 describe_image 加载）
 │   └─ 否则（lazy/eager）→ 加入 groups：
 │       ├─ 有 _pir_optimistic（eager 提前启动）→ groups.append((msg, images_map, task))
 │       └─ 无（lazy 现场）→ groups.append((msg, images_map, _describe_parallel(...)))
@@ -360,6 +361,11 @@ graph LR
 - `terminate()` 取消乐观 task + 保存 id_map
 - 插件钩子整体 try/except 包裹，任何异常只记录不阻断消息处理
 
+### 已知能力边界（上游限制，插件不可解）
+
+- **官方 bot 特殊卡片图片**：QQ 官方 bot（如"今日老婆"）发的特殊卡片，图片是卡片内容——**napcat 未实现该类卡片的读取**（无 image 段、卡片 JSON 不可得），转发节点中只留 `[图片]` 文本占位。KiraAI 与插件均无法读取此类图片（排查结论：napcat 日志确认协议层未实现）
+- **KiraAI 适配器丢弃卡片 preview**：即使 napcat 返回 `json` 段，`extract_card_info` 不提取 `meta.*.preview` 图片 URL——上游改进点（待上游更新）
+
 ---
 
 ## 七、配置项
@@ -371,7 +377,7 @@ graph LR
 | `quality_enabled` | switch | false | JPEG 压缩后再送 VLM |
 | `quality_value` | integer | 85 | JPEG 压缩质量 (10-100) |
 | `id_map_limit` | integer | 1000 | id_map 上限（兼容旧 `llm_select_config` section 内位置，顶层优先） |
-| `forward_max_depth` | integer | 64 | 转发展开层数上限（嵌套 Forward 拍平深度，超限深层无痕省略） |
+| `forward_max_depth` | integer | 1 | 转发展开层数（默认 1=只读第一层，跟从原生；调大展开深层） |
 
 装配：`initialize()` 从 `plugin_cfg` 读取。旧配置兼容：`eager_loading=true` 且未设 `load_mode` → 迁移为 `eager`。
 
