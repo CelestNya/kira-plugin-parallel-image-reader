@@ -330,12 +330,6 @@ class ParallelImageReader(BasePlugin):
             db = self.ctx.db
             cached_count = 0
 
-            # 诊断：打印 chain 元素树（排查 [图片] 占位问题时临时保留）
-            logger.debug(
-                f"[ParallelImageReader] chain tree [{session_key}]:\n"
-                + ParallelImageReader._chain_tree(event.message.chain)
-            )
-
             # 先拍平嵌套 Forward（防核心渲染丢内容），再遍历替换图片
             self._flatten_forwards(event.message.chain,
                                    max_depth=self.forward_max_depth)
@@ -516,39 +510,6 @@ class ParallelImageReader(BasePlugin):
             )
 
     # ── Chain 标识符替换（填充）──
-
-    @staticmethod
-    def _chain_tree(chain, indent=0, visited=None, depth=0) -> str:
-        """打印 chain 元素树（DEBUG 诊断用）。深度限制防恶意深链 RecursionError。"""
-        if visited is None:
-            visited = set()
-        if depth > 32:
-            return "  " * indent + "...(深度截断)\n"
-        cid = id(chain)
-        if cid in visited:
-            return "  " * indent + "↺(环)\n"
-        visited.add(cid)
-        lines = []
-        for ele in chain:
-            pad = "  " * indent
-            t = type(ele).__name__
-            if t == "Forward":
-                lines.append(f"{pad}Forward(chains={len(ele.chains)})")
-                for c in ele.chains:
-                    lines.append(ParallelImageReader._chain_tree(
-                        c, indent + 1, visited, depth + 1).rstrip("\n"))
-            elif t == "Reply":
-                lines.append(f"{pad}Reply(id={getattr(ele, 'message_id', '?')})")
-                if ele.chain is not None:
-                    lines.append(ParallelImageReader._chain_tree(
-                        ele.chain, indent + 1, visited, depth + 1).rstrip("\n"))
-            elif t in ("Image", "Sticker"):
-                src = getattr(ele, "image", getattr(ele, "sticker", "")) or ""
-                lines.append(f"{pad}{t}(src={'url' if src.startswith('http') else 'base64' if src else 'EMPTY'})")
-            else:
-                text = getattr(ele, "text", "") or ""
-                lines.append(f"{pad}{t}({text[:30]!r})")
-        return "\n".join(lines) + "\n"
 
     def _should_auto_read(self, message, event, images_map: dict,
                           batch_image_count: int) -> bool:

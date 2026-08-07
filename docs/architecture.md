@@ -361,6 +361,11 @@ graph LR
 - `terminate()` 取消乐观 task + 保存 id_map
 - 插件钩子整体 try/except 包裹，任何异常只记录不阻断消息处理
 
+### 已知能力边界（上游限制，插件不可解）
+
+- **官方 bot 特殊卡片图片**：QQ 官方 bot（如"今日老婆"）发的特殊卡片，图片是卡片内容——**napcat 未实现该类卡片的读取**（无 image 段、卡片 JSON 不可得），转发节点中只留 `[图片]` 文本占位。KiraAI 与插件均无法读取此类图片（排查结论：napcat 日志确认协议层未实现）
+- **KiraAI 适配器丢弃卡片 preview**：即使 napcat 返回 `json` 段，`extract_card_info` 不提取 `meta.*.preview` 图片 URL——上游改进点（待上游更新）
+
 ---
 
 ## 七、配置项
