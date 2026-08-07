@@ -72,7 +72,10 @@ class Text:
 
 
 class Reply:
-    def __init__(self, chain=None):
+    """对齐真实 KiraAI Reply（message_id 必须存在——stub 缺属性会让
+    插件新代码 AttributeError 被吞，测试假绿）。"""
+    def __init__(self, chain=None, message_id="r1"):
+        self.message_id = str(message_id)
         self.chain = chain
 
 

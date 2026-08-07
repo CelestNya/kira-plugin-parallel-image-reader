@@ -518,10 +518,12 @@ class ParallelImageReader(BasePlugin):
     # ── Chain 标识符替换（填充）──
 
     @staticmethod
-    def _chain_tree(chain, indent=0, visited=None) -> str:
-        """打印 chain 元素树（DEBUG 诊断用）。"""
+    def _chain_tree(chain, indent=0, visited=None, depth=0) -> str:
+        """打印 chain 元素树（DEBUG 诊断用）。深度限制防恶意深链 RecursionError。"""
         if visited is None:
             visited = set()
+        if depth > 32:
+            return "  " * indent + "...(深度截断)\n"
         cid = id(chain)
         if cid in visited:
             return "  " * indent + "↺(环)\n"
@@ -533,11 +535,13 @@ class ParallelImageReader(BasePlugin):
             if t == "Forward":
                 lines.append(f"{pad}Forward(chains={len(ele.chains)})")
                 for c in ele.chains:
-                    lines.append(ParallelImageReader._chain_tree(c, indent + 1, visited).rstrip("\n"))
+                    lines.append(ParallelImageReader._chain_tree(
+                        c, indent + 1, visited, depth + 1).rstrip("\n"))
             elif t == "Reply":
-                lines.append(f"{pad}Reply(id={ele.message_id})")
+                lines.append(f"{pad}Reply(id={getattr(ele, 'message_id', '?')})")
                 if ele.chain is not None:
-                    lines.append(ParallelImageReader._chain_tree(ele.chain, indent + 1, visited).rstrip("\n"))
+                    lines.append(ParallelImageReader._chain_tree(
+                        ele.chain, indent + 1, visited, depth + 1).rstrip("\n"))
             elif t in ("Image", "Sticker"):
                 src = getattr(ele, "image", getattr(ele, "sticker", "")) or ""
                 lines.append(f"{pad}{t}(src={'url' if src.startswith('http') else 'base64' if src else 'EMPTY'})")
