@@ -79,7 +79,7 @@ KiraAI 插件，作为 `data/plugins/parallel_image_reader` 目录加载（symli
 - **消息链**（`message.chain`）：`MessageChain` 包装类，元素为 `Text` / `Image` / `Sticker` / `Reply` / `Forward` 等。插件遍历并**原地替换**其中的图片元素。
 - **消息命运**：chat 插件在 `ON_IM_MESSAGE`（priority 50）决定 `discard` / `buffer` / `flush`；`flush` 时 `message_manager` 将同 session 的 message 聚合成 batch 派发 `ON_IM_BATCH_MESSAGE`，**batch 中的 message 与 IM 阶段是同一实例**（属性得以跨阶段传递）。
 - **持久化**：`message_str` 在 batch 阶段生成 → `ON_IM_BATCH_MESSAGE` 修正 → 入 prompt → 持久化。插件在持久化**之前**完成标识符替换。
-- **工具系统**：`register.tool(name, desc, params_json_schema)` 注册工具；`llm_client.execute_tool(event, resp)` 执行（工具拿到 batch event）；工具结果作为 tool 消息**自动持久化**进历史（agent_executor 行为）。
+- **工具系统**：`register.tool(name, desc, params_json_schema)` 注册工具；工具执行由 `FuncToolManager.execute_tool(event, resp)`（v2.29.5+，原 `LLMClient.execute_tool`）完成，工具拿到 batch event；工具结果作为 tool 消息**自动持久化**进历史（agent_executor 行为）。
 
 ---
 

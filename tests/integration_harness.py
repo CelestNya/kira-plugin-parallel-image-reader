@@ -153,7 +153,7 @@ class Harness:
         from core.db.db_mgr import DatabaseManager
         from core.db.service import DatabaseService
         from core.chat.session_manager import SessionManager
-        from core.llm_client import LLMClient
+        from core.agent.func_tool_manager import FuncToolManager
         from core.prompt_manager import PromptManager
         from core.persona import PersonaManager
         from core.message_manager import MessageProcessor
@@ -176,7 +176,7 @@ class Harness:
 
         # 3. Provider / LLM / Skills / Adapter
         self.provider = _FakeProviderManager(self.llm, self.vlm)
-        self.llm_api = LLMClient(self.cfg, self.provider)
+        self.tool_mgr = FuncToolManager(self.cfg)
         self.skills = _FakeSkillsManager()
         self.adapter_info = AdapterInfo(
             enabled=True, adapter_id="test", name="qq",
@@ -196,7 +196,7 @@ class Harness:
         self.mp = MessageProcessor(
             db=self.db,
             kira_config=self.cfg,
-            llm_api=self.llm_api,
+            tool_manager=self.tool_mgr,
             provider_manager=self.provider,
             skills_manager=self.skills,
             adapter_manager=self.adapters,
@@ -227,7 +227,7 @@ class Harness:
             config=self.cfg,
             event_bus=self.event_bus,
             provider_mgr=self.provider,
-            llm_api=self.llm_api,
+            tool_mgr=self.tool_mgr,
             adapter_mgr=self.adapters,
             persona_mgr=self.persona,
             sticker_manager=None,
@@ -249,9 +249,8 @@ class Harness:
             eh = EventHandler(event_type=etype, priority=prio, handler=func, desc=func.__doc__)
             event_handler_reg.register(eh)
 
-        # 注册工具到 llm_api（模拟 plugin_manager._register_plugin_tools_for 的效果）
-        # build_tool_set() 从 llm_api.tools_definitions 构建，工具才能被 LLM 调用
-        self.llm_api.register_tool(
+        # 注册工具到 tool_mgr（模拟 plugin_manager._register_plugin_tools_for 的效果）
+        self.tool_mgr.register_tool(
             name="describe_image",
             description="获取图片内容描述。当消息中包含 [Image #xxxx: ] 格式标识符且你需要了解图片内容时调用，传入标识符中的 xxxx。",
             parameters={
